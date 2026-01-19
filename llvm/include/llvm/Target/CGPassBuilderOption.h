@@ -28,7 +28,7 @@ enum class RunOutliner {
   ConservativePGO,
   NeverOutline
 };
-enum class RegAllocType { Unset, Default, Basic, Fast, Greedy, PBQP };
+enum class RegAllocType { Unset, Default, Basic, Fast, Greedy, PBQP, PBQPAsp };
 
 class RegAllocTypeParser : public cl::parser<RegAllocType> {
 public:
@@ -38,6 +38,7 @@ public:
     addLiteralOption("default", RegAllocType::Default,
                      "Default register allocator");
     addLiteralOption("pbqp", RegAllocType::PBQP, "PBQP register allocator");
+    addLiteralOption("pbqp-asp", RegAllocType::PBQPAsp, "PBQP register allocator using ASP solver");
     addLiteralOption("fast", RegAllocType::Fast, "Fast register allocator");
     addLiteralOption("basic", RegAllocType::Basic, "Basic register allocator");
     addLiteralOption("greedy", RegAllocType::Greedy,
