@@ -121,7 +121,7 @@ endif()
 # LLVM_ENABLE_RUNTIMES instead of LLVM_ENABLE_PROJECTS.
 #
 # The flang project is not yet part of "all" projects (see C++ requirements).
-set(LLVM_EXTRA_PROJECTS "flang" "libc")
+set(LLVM_EXTRA_PROJECTS "flang" "libc" "clingo")
 # List of all known projects in the mono repo
 set(LLVM_KNOWN_PROJECTS "${LLVM_ALL_PROJECTS};${LLVM_EXTRA_PROJECTS}")
 set(LLVM_ENABLE_PROJECTS "" CACHE STRING
@@ -129,6 +129,21 @@ set(LLVM_ENABLE_PROJECTS "" CACHE STRING
 # Make sure expansion happens first to not handle "all" in rest of the checks.
 if( LLVM_ENABLE_PROJECTS STREQUAL "all" )
   set( LLVM_ENABLE_PROJECTS ${LLVM_ALL_PROJECTS})
+endif()
+
+# Configure clingo subproject options
+if("clingo" IN_LIST LLVM_ENABLE_PROJECTS)
+  # Build clingo and all dependencies as static libraries for easier integration
+  # Disable all applications and scripts to avoid complex linking issues
+  set(CLINGO_BUILD_STATIC ON CACHE BOOL "Build clingo statically for LLVM integration" FORCE)
+  set(CLINGO_BUILD_APPS OFF CACHE BOOL "Don't build clingo apps" FORCE)
+  set(CLINGO_BUILD_TESTS OFF CACHE BOOL "Don't build clingo tests" FORCE)
+  set(CLINGO_BUILD_EXAMPLES OFF CACHE BOOL "Don't build clingo examples" FORCE)
+  set(CLINGO_BUILD_WITH_PYTHON OFF CACHE BOOL "Disable Python bindings" FORCE)
+  set(CLINGO_BUILD_WITH_LUA OFF CACHE BOOL "Disable Lua bindings" FORCE)
+  set(CLASP_BUILD_STATIC ON CACHE BOOL "Build Clasp statically for clingo integration" FORCE)
+  set(CLASP_BUILD_APP OFF CACHE BOOL "Don't build clasp executable when building for LLVM" FORCE)
+  set(CLINGO_MANAGE_RPATH OFF CACHE BOOL "Disable RPATH management" FORCE)
 endif()
 
 # The pstl project was removed. Ignore it to pacify certain buildbots.

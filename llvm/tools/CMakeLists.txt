@@ -67,6 +67,11 @@ endforeach(p)
 
 set(LLVM_COMMON_DEPENDS ${LLVM_COMMON_DEPENDS} PARENT_SCOPE)
 
+# Add clingo-test tool if clingo is enabled
+if("clingo" IN_LIST LLVM_ENABLE_PROJECTS)
+  add_llvm_tool_subdirectory(clingo-test)
+endif()
+
 if (LLVM_TOOL_LLVM_DRIVER_BUILD)
   # This is explicitly added at the end _after_ all tool projects so that it can
   # scrape up tools from other projects into itself.

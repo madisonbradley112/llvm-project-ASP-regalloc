@@ -1,3 +1,6 @@
 [submodule "llvm/projects/clingo"]
 	path = llvm/projects/clingo
 	url = https://github.com/potassco/clingo
+[submodule "clingo"]
+	path = clingo
+	url = https://github.com/potassco/clingo.git
