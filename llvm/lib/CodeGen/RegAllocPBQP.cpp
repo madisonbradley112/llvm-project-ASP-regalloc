@@ -29,6 +29,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/RegAllocPBQP.h"
+#include "llvm/CodeGen/PBQPComparison.h"
 #include "RegisterCoalescer.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
@@ -98,6 +99,16 @@ static cl::opt<bool>
 PBQPCoalescing("pbqp-coalescing",
                 cl::desc("Attempt coalescing during PBQP register allocation."),
                 cl::init(false), cl::Hidden);
+
+static cl::opt<std::string>
+PBQPExportResults("pbqp-export-results",
+                  cl::desc("Export PBQP allocation results to file (JSON format)."),
+                  cl::value_desc("filename"), cl::Hidden);
+
+static cl::opt<std::string>
+PBQPExportResultsText("pbqp-export-results-text",
+                      cl::desc("Export PBQP allocation results to file (text format)."),
+                      cl::value_desc("filename"), cl::Hidden);
 
 #ifndef NDEBUG
 static cl::opt<bool>
@@ -746,7 +757,66 @@ bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
     }
   }
 
+  // After solving, emit allocation decisions
+  LLVM_DEBUG({
+    dbgs() << "PBQP Allocation Results:\n";
+    for (auto &VReg : VRegsToAlloc) {
+      unsigned PhysReg = VRM.getPhys(VReg);
+      dbgs() << "  VReg " << VReg << " -> ";
+      if (PhysReg == 0) {
+        dbgs() << "SPILLED";
+      } else {
+        dbgs() << printReg(PhysReg, &TRI);
+      }
+      dbgs() << "\n";
+    }
+  });
+
+  // Capture allocation results for comparison/analysis
+  if (!PBQPExportResults.empty() || !PBQPExportResultsText.empty()) {
+    AllocationResult Result;
+    Result.FunctionName = MF.getName().str();
+    Result.Round = 0;  // Could be enhanced to track round number
+
+    for (auto &VReg : VRegsToAlloc) {
+      unsigned PhysReg = VRM.getPhys(VReg);
+      bool IsSpilled = (PhysReg == 0);
+      std::string RegName = IsSpilled ? "SPILLED" : TRI.getName(PhysReg).str();
+      double Cost = IsSpilled ? 1000.0 : 0.0;  // Simplified cost; could be enhanced
+      Result.addAllocation(VReg, PhysReg, RegName, Cost, IsSpilled);
+    }
+
+    // Export to JSON
+    if (!PBQPExportResults.empty()) {
+      std::error_code EC;
+      raw_fd_ostream OS(PBQPExportResults, EC);
+      if (!EC) {
+        Result.exportToJSON(OS);
+        LLVM_DEBUG(dbgs() << "Exported allocation results to " << PBQPExportResults
+                          << "\n");
+      } else {
+        LLVM_DEBUG(dbgs() << "Failed to export allocation results: "
+                          << EC.message() << "\n");
+      }
+    }
+
+    // Export to text
+    if (!PBQPExportResultsText.empty()) {
+      std::error_code EC;
+      raw_fd_ostream OS(PBQPExportResultsText, EC);
+      if (!EC) {
+        Result.exportToText(OS);
+        LLVM_DEBUG(dbgs() << "Exported allocation results to "
+                          << PBQPExportResultsText << "\n");
+      } else {
+        LLVM_DEBUG(dbgs() << "Failed to export allocation results: "
+                          << EC.message() << "\n");
+      }
+    }
+  }
+
   return !AnotherRoundNeeded;
+
 }
 
 void RegAllocPBQP::finalizeAlloc(MachineFunction &MF,

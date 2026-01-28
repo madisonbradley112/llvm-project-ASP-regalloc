@@ -531,6 +531,10 @@ inline Solution solve(PBQPRAGraph& G) {
 FunctionPass *
 createPBQPRegisterAllocator(char *customPassID = nullptr);
 
+/// Create an ASP-based PBQP register allocator instance.
+FunctionPass *
+createPBQPASPRegisterAllocator(char *customPassID = nullptr);
+
 } // end namespace llvm
 
 #endif // LLVM_CODEGEN_REGALLOCPBQP_H
