@@ -4,7 +4,6 @@
 % - Assignments:         assign(SymReg, CPUReg)
 
 #show assign/2.
-% #show cost/2. 
 #show total_cost/1.
 #show spill_cost/3.
 #show copy_propagation_cost/3.
@@ -24,19 +23,22 @@ spill_cost(S, A, C) :- sym_register(S), cpu_register(A),
 
 
 %=========== Interference Constraint ===========
-% Indicates that two symbolic registers "interfere" together - that is, 
+% Indicates that two symbolic registers "interfere" together - that is,
 % they must be assigned to two different CPU registers.
-% "Interfering" typically means that two variables are live at 
-% the same time in a program. 
+% "Interfering" typically means that two variables are live at
+% the same time in a program.
 % In Scholz and Eckstein's work, this is represented as an infinity cost.
-% We can represent it as a constraint. 
+% We can represent it as a constraint.
+
+% interference is symmetric: if S1 interferes with S2, so does S2 with S1.
+interferes(S1, S2) :- interferes(S2, S1).
 
 % symbolic registers S1 and S2 cannot interfere
 % and be assigned to the same register
 :- interferes(S1, S2),
-   sym_register(S1), sym_register(S2), 
+   sym_register(S1), sym_register(S2), S1 < S2,
    cpu_register(A1),  cpu_register(A2),
-   assign(S1, A1), assign(S2, A2), 
+   assign(S1, A1), assign(S2, A2),
    A1 == A2, A1 != sp.
 
 %=========== Class Constraint ===========
@@ -118,14 +120,17 @@ generic_constraint :- generic_constraint(S1, S2, A1, A2).
 % assign each symbolic register to a CPU register
 1 { assign(S,A) : cpu_register(A) } 1 :- sym_register(S).
 
-% the total cost of a symbolic assignment S is the sum of all
-% costs associated with S. 
-cost(C, S, spill) :- spill_cost(S, _, C).
-cost(C, S, copy_propagation) :- copy_propagation_cost(S, _, C).
-cost(C, S, param_propagation) :- param_copy_propagation_cost(S, _, _, C).
-
-% get a *total* assignment cost over all assignments
-total_cost(C) :- C = #sum { K, V, T : cost(K, V, T) }.
+% Total cost is the sum of all spill costs, copy-propagation benefits, and
+% parameter copy-propagation benefits.
+%
+% Each aggregate tuple includes all identifying terms so that distinct
+% beneficial pairs with the same numeric value are counted separately
+% (Clingo's #sum uses set semantics on the full tuple, not just the weight).
+total_cost(C) :- C = #sum {
+    K, S, sp, spill          : spill_cost(S, sp, K) ;
+    K, S1, S2, copy_prop     : copy_propagation_cost(S1, S2, K) ;
+    K, S, A, Rc, param_copy  : param_copy_propagation_cost(S, A, Rc, K)
+}.
 
 % now, we minimize costs over all register assignments
-#minimize { C: total_cost(C)}.
+#minimize { C: total_cost(C) }.

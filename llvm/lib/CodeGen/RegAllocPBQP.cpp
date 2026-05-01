@@ -728,7 +728,6 @@ bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
   MachineFunction &MF = G.getMetadata().MF;
   LiveIntervals &LIS = G.getMetadata().LIS;
   const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
-  (void)TRI;
 
   // Set to true if we have any spills
   bool AnotherRoundNeeded = false;
@@ -776,13 +775,17 @@ bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
   if (!PBQPExportResults.empty() || !PBQPExportResultsText.empty()) {
     AllocationResult Result;
     Result.FunctionName = MF.getName().str();
-    Result.Round = 0;  // Could be enhanced to track round number
+    Result.Round = 0;
 
-    for (auto &VReg : VRegsToAlloc) {
-      unsigned PhysReg = VRM.getPhys(VReg);
-      bool IsSpilled = (PhysReg == 0);
+    // Iterate over graph nodes so we can read the actual PBQP node cost for
+    // the selected option (index 0 = spill cost, 1..N = register costs).
+    for (auto NId : G.nodeIds()) {
+      Register VReg = G.getNodeMetadata(NId).getVReg();
+      unsigned AllocOpt = Solution.getSelection(NId);
+      bool IsSpilled = (AllocOpt == PBQP::RegAlloc::getSpillOptionIdx());
+      unsigned PhysReg = IsSpilled ? 0 : VRM.getPhys(VReg);
       std::string RegName = IsSpilled ? "SPILLED" : TRI.getName(PhysReg).str();
-      double Cost = IsSpilled ? 1000.0 : 0.0;  // Simplified cost; could be enhanced
+      double Cost = G.getNodeCosts(NId)[AllocOpt];
       Result.addAllocation(VReg, PhysReg, RegName, Cost, IsSpilled);
     }
 
