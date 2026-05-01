@@ -291,6 +291,24 @@ add_llvm_component_library(LLVMCodeGen
   TransformUtils
   )
 
+# Link Clingo into LLVMCodeGen when the clingo subproject is enabled, so the
+# ASP-based PBQP solver (RegAllocPBQPASP.cpp) can call libclingo in-process.
+# When clingo is disabled, the .cpp file still compiles but aspSolve() is a
+# stub that errors at runtime; this keeps the build working without clingo.
+if("clingo" IN_LIST LLVM_ENABLE_PROJECTS)
+  target_compile_definitions(LLVMCodeGen PRIVATE LLVM_PBQP_HAVE_CLINGO)
+  target_include_directories(LLVMCodeGen PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../clingo/libclingo
+  )
+  target_link_libraries(LLVMCodeGen PRIVATE
+    ${CMAKE_BINARY_DIR}/lib/libclingo.a
+    ${CMAKE_BINARY_DIR}/lib/libgringo.a
+    ${CMAKE_BINARY_DIR}/lib/libreify.a
+    ${CMAKE_BINARY_DIR}/lib/libclasp.dylib
+    ${CMAKE_BINARY_DIR}/lib/libpotassco.dylib
+  )
+endif()
+
 add_subdirectory(SelectionDAG)
 add_subdirectory(AsmPrinter)
 add_subdirectory(MIRParser)

@@ -30,6 +30,7 @@
 
 #include "llvm/CodeGen/RegAllocPBQP.h"
 #include "llvm/CodeGen/PBQPComparison.h"
+#include "llvm/CodeGen/RegAllocPBQPASP.h"
 #include "RegisterCoalescer.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
@@ -109,6 +110,12 @@ static cl::opt<std::string>
 PBQPExportResultsText("pbqp-export-results-text",
                       cl::desc("Export PBQP allocation results to file (text format)."),
                       cl::value_desc("filename"), cl::Hidden);
+
+static cl::opt<bool>
+PBQPUseASPSolver("pbqp-use-asp-solver",
+                 cl::desc("Use the ASP/Clingo solver instead of LLVM's "
+                          "built-in PBQP graph reduction."),
+                 cl::init(false), cl::Hidden);
 
 #ifndef NDEBUG
 static cl::opt<bool>
@@ -941,7 +948,9 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
       }
 #endif
 
-      PBQP::Solution Solution = PBQP::RegAlloc::solve(G);
+      PBQP::Solution Solution = PBQPUseASPSolver
+                                    ? PBQP::RegAlloc::aspSolve(G)
+                                    : PBQP::RegAlloc::solve(G);
       PBQPAllocComplete = mapPBQPToRegAlloc(G, Solution, VRM, *VRegSpiller);
       ++Round;
     }
