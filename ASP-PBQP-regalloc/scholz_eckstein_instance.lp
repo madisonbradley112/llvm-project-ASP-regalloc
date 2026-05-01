@@ -1,10 +1,10 @@
 % ==== REGISTER ASSIGNMENTS =======
-sym_register(sa0; sa1; sa2; sn0; sn1; sn2; sn3; sf1; sf2; sfl0;).
-cpu_register(a0; a1; a2; a3; n0; n1; fl0; fl1; f0; f2; f1; f3).
-cpu_register(b0; b1; b2; b3; b4; b5; b6; b7; b8; b9; b10; b11).
-sym_register(ba0; ba1; ba2; bn0; bn1; bn2; bn3; bf1; bf2; bfl0;).
-sym_register(da0; da1; da2; dn0; dn1; dn2; dn3; df1; df2; dfl0;).
-sym_register(ca0; ca1; ca2; cn0; cn1; cn2; cn3; cf1; cf2; cfl0;).
+% Symbolic registers from the Scholz-Eckstein example:
+%   sa* = address class, sn* = index class,
+%   sf* = short-float class, sfl* = long-float class
+sym_register(sa0; sa1; sa2; sn0; sn1; sn2; sn3; sf1; sf2; sfl0).
+% CPU registers for each class, plus the imaginary spill register sp
+cpu_register(a0; a1; a2; a3; n0; n1; fl0; fl1; f0; f1; f2; f3).
 
 
 
