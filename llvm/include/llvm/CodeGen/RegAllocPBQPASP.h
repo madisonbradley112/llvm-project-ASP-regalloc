@@ -33,7 +33,7 @@ namespace RegAlloc {
 ///
 /// Aborts with report_fatal_error if the encoding is UNSAT or Clingo fails;
 /// such cases indicate a malformed graph (no valid allocation exists).
-Solution aspSolve(const PBQPRAGraph &G);
+Solution aspSolve(PBQPRAGraph &G);
 
 } // namespace RegAlloc
 } // namespace PBQP

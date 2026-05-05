@@ -216,6 +216,47 @@ namespace PBQP {
     return s;
   }
 
+  // Seeded variant: start from a pre-populated solution (e.g. hard-node
+  // selections already set by an external solver) and backpropagate only
+  // the nodes in `stack`.  The caller is responsible for ensuring that any
+  // neighbour looked up via getSelection() is already present in `seed`.
+  template <typename GraphT, typename StackT>
+  Solution backpropagate(GraphT& G, StackT stack, Solution seed) {
+    using NodeId = GraphBase::NodeId;
+    using Matrix = typename GraphT::Matrix;
+    using RawVector = typename GraphT::RawVector;
+
+    Solution s = std::move(seed);
+
+    while (!stack.empty()) {
+      NodeId NId = stack.back();
+      stack.pop_back();
+
+      RawVector v = G.getNodeCosts(NId);
+
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+      if (G.getNodeMetadata(NId).wasConservativelyAllocatable())
+        assert(hasRegisterOptions(v) && "A conservatively allocatable node "
+                                        "must have available register options");
+#endif
+
+      for (auto EId : G.adjEdgeIds(NId)) {
+        const Matrix& edgeCosts = G.getEdgeCosts(EId);
+        if (NId == G.getEdgeNode1Id(EId)) {
+          NodeId mId = G.getEdgeNode2Id(EId);
+          v += edgeCosts.getColAsVector(s.getSelection(mId));
+        } else {
+          NodeId mId = G.getEdgeNode1Id(EId);
+          v += edgeCosts.getRowAsVector(s.getSelection(mId));
+        }
+      }
+
+      s.setSelection(NId, v.minIndex());
+    }
+
+    return s;
+  }
+
 } // end namespace PBQP
 } // end namespace llvm
 

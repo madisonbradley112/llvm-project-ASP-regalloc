@@ -1,10 +1,11 @@
 add_llvm_tool(clingo-test
   ClingoTest.cpp
+  PARTIAL_SOURCES_INTENDED
 )
 
 target_include_directories(clingo-test
   PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../projects/clingo/clingo/libclingo
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../projects/clingo/libclingo
 )
 
 target_link_libraries(clingo-test
