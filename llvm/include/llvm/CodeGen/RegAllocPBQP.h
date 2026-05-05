@@ -287,6 +287,8 @@ public:
 
   using Graph = PBQP::Graph<RegAllocSolverImpl>;
 
+  using NodeSet = std::set<NodeId>;
+
   RegAllocSolverImpl(Graph &G) : G(G) {}
 
   Solution solve() {
@@ -297,6 +299,44 @@ public:
     G.unsetSolver();
     return S;
   }
+
+  // Apply R0/R1/R2 and conservative-allocation reduction, stopping before any
+  // NotProvablyAllocatable node is touched.  After this call the graph contains
+  // only the hard sub-problem (nodes in getHardNodes()).  The caller must have
+  // already called G.setSolver(*this).  Returns the partial reduction stack for
+  // use with backpropagate().
+  std::vector<NodeId> partialReduce() {
+    assert(!G.empty() && "Cannot reduce empty graph.");
+    std::vector<NodeId> NodeStack;
+    setup();
+
+    while (true) {
+      if (!OptimallyReducibleNodes.empty()) {
+        NodeId NId = *OptimallyReducibleNodes.begin();
+        OptimallyReducibleNodes.erase(OptimallyReducibleNodes.begin());
+        NodeStack.push_back(NId);
+        switch (G.getNodeDegree(NId)) {
+        case 0: break;
+        case 1: applyR1(G, NId); break;
+        case 2: applyR2(G, NId); break;
+        default: llvm_unreachable("Not an optimally reducible node.");
+        }
+      } else if (!ConservativelyAllocatableNodes.empty()) {
+        NodeId NId = *ConservativelyAllocatableNodes.begin();
+        ConservativelyAllocatableNodes.erase(ConservativelyAllocatableNodes.begin());
+        NodeStack.push_back(NId);
+        G.disconnectAllNeighborsFromNode(NId);
+      } else {
+        break; // only NotProvablyAllocatable nodes remain
+      }
+    }
+
+    return NodeStack;
+  }
+
+  // Nodes remaining in the graph after partialReduce() — these are the
+  // NotProvablyAllocatable nodes that require an external solver.
+  const NodeSet& getHardNodes() const { return NotProvablyAllocatableNodes; }
 
   void handleAddNode(NodeId NId) {
     assert(G.getNodeCosts(NId).getLength() > 1 &&
@@ -492,7 +532,6 @@ private:
   };
 
   Graph& G;
-  using NodeSet = std::set<NodeId>;
   NodeSet OptimallyReducibleNodes;
   NodeSet ConservativelyAllocatableNodes;
   NodeSet NotProvablyAllocatableNodes;

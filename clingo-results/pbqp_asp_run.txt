@@ -1,0 +1,13 @@
+Function: sink
+Round: 0
+Total Cost: 0.00
+VRegs: 8, Spilled: 0
+---
+VReg2147483648 -> W8 (216) (cost: 0.00)
+VReg2147483649 -> W12 (220) (cost: 0.00)
+VReg2147483650 -> W9 (217) (cost: 0.00)
+VReg2147483651 -> W18 (226) (cost: 0.00)
+VReg2147483652 -> W11 (219) (cost: 0.00)
+VReg2147483653 -> W14 (222) (cost: 0.00)
+VReg2147483654 -> W7 (215) (cost: 0.00)
+VReg2147483655 -> W10 (218) (cost: 0.00)

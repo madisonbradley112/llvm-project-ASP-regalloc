@@ -1,0 +1,65 @@
+{
+  "function": "sink",
+  "round": 0,
+  "total_cost": 0.00,
+  "num_vregs": 8,
+  "num_spilled": 0,
+  "allocations": [
+    {
+      "vreg": 2147483648,
+      "physreg": 216,
+      "reg_name": "W8",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483649,
+      "physreg": 220,
+      "reg_name": "W12",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483650,
+      "physreg": 217,
+      "reg_name": "W9",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483651,
+      "physreg": 226,
+      "reg_name": "W18",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483652,
+      "physreg": 219,
+      "reg_name": "W11",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483653,
+      "physreg": 222,
+      "reg_name": "W14",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483654,
+      "physreg": 215,
+      "reg_name": "W7",
+      "cost": 0.00,
+      "spilled": false
+    },
+    {
+      "vreg": 2147483655,
+      "physreg": 218,
+      "reg_name": "W10",
+      "cost": 0.00,
+      "spilled": false
+    }
+  ]
+}

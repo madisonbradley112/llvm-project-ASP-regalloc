@@ -30,6 +30,7 @@
 
 #include "llvm/CodeGen/RegAllocPBQP.h"
 #include "llvm/CodeGen/PBQPComparison.h"
+#include "llvm/CodeGen/RegAllocPBQPASP.h"
 #include "RegisterCoalescer.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
@@ -109,6 +110,12 @@ static cl::opt<std::string>
 PBQPExportResultsText("pbqp-export-results-text",
                       cl::desc("Export PBQP allocation results to file (text format)."),
                       cl::value_desc("filename"), cl::Hidden);
+
+static cl::opt<bool>
+PBQPUseASPSolver("pbqp-use-asp-solver",
+                 cl::desc("Use the ASP/Clingo solver instead of LLVM's "
+                          "built-in PBQP graph reduction."),
+                 cl::init(false), cl::Hidden);
 
 #ifndef NDEBUG
 static cl::opt<bool>
@@ -783,19 +790,23 @@ bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
       Register VReg = G.getNodeMetadata(NId).getVReg();
       unsigned AllocOpt = Solution.getSelection(NId);
       bool IsSpilled = (AllocOpt == PBQP::RegAlloc::getSpillOptionIdx());
-      unsigned PhysReg = IsSpilled ? 0 : VRM.getPhys(VReg);
-      std::string RegName = IsSpilled ? "SPILLED" : TRI.getName(PhysReg).str();
+      unsigned PhysReg = IsSpilled ? 0u : VRM.getPhys(VReg).id();
+      std::string RegName = IsSpilled ? "SPILLED" : TRI.getName(PhysReg);
       double Cost = G.getNodeCosts(NId)[AllocOpt];
       Result.addAllocation(VReg, PhysReg, RegName, Cost, IsSpilled);
     }
 
-    // Export to JSON
+    // Export to JSON (append each function's result into the same file)
     if (!PBQPExportResults.empty()) {
       std::error_code EC;
-      raw_fd_ostream OS(PBQPExportResults, EC);
+      uint64_t FileSize = 0;
+      std::error_code SizeEC = sys::fs::file_size(PBQPExportResults, FileSize);
+      raw_fd_ostream OS(PBQPExportResults, EC, sys::fs::OF_Append);
       if (!EC) {
+        if (!SizeEC && FileSize > 0)
+          OS << "\n";
         Result.exportToJSON(OS);
-        LLVM_DEBUG(dbgs() << "Exported allocation results to " << PBQPExportResults
+        LLVM_DEBUG(dbgs() << "Appended allocation results to " << PBQPExportResults
                           << "\n");
       } else {
         LLVM_DEBUG(dbgs() << "Failed to export allocation results: "
@@ -803,13 +814,17 @@ bool RegAllocPBQP::mapPBQPToRegAlloc(const PBQPRAGraph &G,
       }
     }
 
-    // Export to text
+    // Export to text (append each function's result into the same file)
     if (!PBQPExportResultsText.empty()) {
       std::error_code EC;
-      raw_fd_ostream OS(PBQPExportResultsText, EC);
+      uint64_t FileSize = 0;
+      std::error_code SizeEC = sys::fs::file_size(PBQPExportResultsText, FileSize);
+      raw_fd_ostream OS(PBQPExportResultsText, EC, sys::fs::OF_Append);
       if (!EC) {
+        if (!SizeEC && FileSize > 0)
+          OS << "\n";
         Result.exportToText(OS);
-        LLVM_DEBUG(dbgs() << "Exported allocation results to "
+        LLVM_DEBUG(dbgs() << "Appended allocation results to "
                           << PBQPExportResultsText << "\n");
       } else {
         LLVM_DEBUG(dbgs() << "Failed to export allocation results: "
@@ -941,7 +956,9 @@ bool RegAllocPBQP::runOnMachineFunction(MachineFunction &MF) {
       }
 #endif
 
-      PBQP::Solution Solution = PBQP::RegAlloc::solve(G);
+      PBQP::Solution Solution = PBQPUseASPSolver
+                                    ? PBQP::RegAlloc::aspSolve(G)
+                                    : PBQP::RegAlloc::solve(G);
       PBQPAllocComplete = mapPBQPToRegAlloc(G, Solution, VRM, *VRegSpiller);
       ++Round;
     }
