@@ -4,3 +4,6 @@
 [submodule "clingo"]
 	path = clingo
 	url = https://github.com/potassco/clingo.git
+[submodule "llvm-test-suite"]
+	path = llvm-test-suite
+	url = git@github.com:llvm/llvm-test-suite.git
