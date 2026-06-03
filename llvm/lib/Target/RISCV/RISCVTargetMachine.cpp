@@ -115,6 +115,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVPostLegalizerCombinerPass(*PR);
   initializeKCFIPass(*PR);
   initializeRISCVDeadRegisterDefinitionsPass(*PR);
+  initializeRISCVRVCRegAllocHintsPass(*PR);
   initializeRISCVLateBranchOptPass(*PR);
   initializeRISCVMakeCompressibleOptPass(*PR);
   initializeRISCVGatherScatterLoweringPass(*PR);
@@ -603,6 +604,10 @@ void RISCVPassConfig::addPreRegAlloc() {
     addPass(&MachinePipelinerID);
 
   addPass(createRISCVVMV0EliminationPass());
+
+  // Phase-1 ASP GPRC allocation hints. Self-gates on -riscv-asp-rvc-regalloc
+  // (off by default), so this is a no-op unless explicitly enabled.
+  addPass(createRISCVRVCRegAllocHintsPass());
 }
 
 void RISCVPassConfig::addFastRegAlloc() {

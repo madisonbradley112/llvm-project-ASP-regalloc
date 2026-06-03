@@ -61,6 +61,7 @@ add_llvm_target(RISCVCodeGen
   RISCVPushPopOptimizer.cpp
   RISCVRedundantCopyElimination.cpp
   RISCVRegisterInfo.cpp
+  RISCVRVCRegAllocHints.cpp
   RISCVSelectionDAGInfo.cpp
   RISCVSubtarget.cpp
   RISCVTargetMachine.cpp
@@ -102,6 +103,24 @@ add_llvm_target(RISCVCodeGen
   ADD_TO_COMPONENT
   RISCV
   )
+
+# Link Clingo into LLVMRISCVCodeGen when the clingo subproject is enabled, so
+# the phase-1 ASP GPRC allocator (RISCVRVCRegAllocHints.cpp) can call libclingo
+# in-process. When clingo is disabled the .cpp still compiles but the pass is a
+# runtime no-op, keeping the build working without clingo.
+if("clingo" IN_LIST LLVM_ENABLE_PROJECTS)
+  target_compile_definitions(LLVMRISCVCodeGen PRIVATE LLVM_PBQP_HAVE_CLINGO)
+  target_include_directories(LLVMRISCVCodeGen PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../clingo/libclingo
+  )
+  target_link_libraries(LLVMRISCVCodeGen PRIVATE
+    ${CMAKE_BINARY_DIR}/lib/libclingo.a
+    ${CMAKE_BINARY_DIR}/lib/libgringo.a
+    ${CMAKE_BINARY_DIR}/lib/libreify.a
+    ${CMAKE_BINARY_DIR}/lib/libclasp.dylib
+    ${CMAKE_BINARY_DIR}/lib/libpotassco.dylib
+  )
+endif()
 
 add_subdirectory(AsmParser)
 add_subdirectory(Disassembler)

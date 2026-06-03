@@ -31,6 +31,9 @@ void initializeRISCVCodeGenPreparePass(PassRegistry &);
 FunctionPass *createRISCVDeadRegisterDefinitionsPass();
 void initializeRISCVDeadRegisterDefinitionsPass(PassRegistry &);
 
+FunctionPass *createRISCVRVCRegAllocHintsPass();
+void initializeRISCVRVCRegAllocHintsPass(PassRegistry &);
+
 FunctionPass *createRISCVIndirectBranchTrackingPass();
 void initializeRISCVIndirectBranchTrackingPass(PassRegistry &);
 
