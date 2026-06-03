@@ -1,0 +1,27 @@
+- name: C.ADDI4SPN
+  full: addi
+  format: CIW
+  description: Adds a zero-extended non-zero immediate, scaled by 4 to the stack pointer x2 and writes the result to rd'
+  constraints:
+    - rd_eq_rs1: false
+    - rd: GPRC
+    - rs1: SP
+    - immediate_signed: false
+    - immediate_length: 10
+    - immediate_lsb_0: 2
+    - immediate_nonzero: true
+  size_compressed: 2
+  size_full: 4
+
+- name: C.FLD
+  full: fld
+  format: CS
+  description: RV32DC/RV64DC-only instruction that loads a double-precision floating-point value from memory into floating point register rd'. It computes an effective address by adding the zero-extended offset, scaled by 8, to the base register rs1'.
+  constraints: 
+    - rd_eq_rs1: false
+    - rd: FPR64C
+    - rs1: GPRC
+    - immediate_signed: false
+    - immediate_length: 10
+    - immediate_lsb_0: 3
+
