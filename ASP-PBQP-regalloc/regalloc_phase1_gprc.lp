@@ -36,7 +36,10 @@
 % ===========================================================================
 
 % ---- Derived sets ---------------------------------------------------------
-gprc_vreg(V) :- needs_gprc(_, V), not precolored(V, _).
+% A vreg is a free GPRC-placement candidate unless it is ABI-pinned: either to
+% a GPRC physreg (precolored/2, fixed there) or to a non-GPRC physreg
+% (pinned_nongprc/1, can never be GPRC, so its candidates are blocked).
+gprc_vreg(V) :- needs_gprc(_, V), not precolored(V, _), not pinned_nongprc(V).
 
 tied_sym(A, B) :- tied(A, B).
 tied_sym(A, B) :- tied(B, A).
@@ -61,8 +64,33 @@ blocked(I)  :- needs_gprc(I, V), not in_gprc(V).
 realized(I) :- cand(I), not blocked(I).
 demoted(I)  :- cand(I), not realized(I).
 
-% ---- Objective: maximize bytes saved by realized compressions -------------
-#maximize { B@1, I : realized(I), cand_saving(I, B) }.
+% ---- Callee-saved cost ----------------------------------------------------
+% A callee-saved GPRC register (x8/x9 under the standard ABI) costs a prologue
+% save/restore. gprc_callee_saved/1 marks those registers; cs_surcharge/1 and
+% cs_per_reg/1 give the spill cost in bytes (same unit as cand_saving):
+%   * cs_surcharge -- paid once if ANY callee-saved GPRC register is touched
+%     (the frame setup, or the call/tail into save-restore millicode).
+%   * cs_per_reg    -- paid for EACH callee-saved register (the save/restore
+%     pair under an inline frame; ~0 under save-restore/Zcmp where a single
+%     pushed/popped list amortizes the whole range).
+% The upstream pass supplies these as facts per the active spill mechanism:
+%   inline frame    -> cs_surcharge(4). cs_per_reg(4).   (first reg = 8 bytes)
+%   save-restore    -> cs_surcharge(8). cs_per_reg(0).
+%   Zcmp push/pop   -> cs_surcharge(2). cs_per_reg(0).
+% For standalone runs of this file, edit the two facts below to taste.
+cs_surcharge(4).
+cs_per_reg(4).
+
+used_callee_saved(R) :- in_gprc(_, R), gprc_callee_saved(R).
+any_callee_saved     :- used_callee_saved(_).
+
+% ---- Objective ------------------------------------------------------------
+% Single @2 level: maximize realized compression bytes minus the true spill
+% cost of any callee-saved GPRC registers touched, so a candidate is realized
+% only when its saving exceeds the spill it forces.
+#maximize { B@2, realized, I : realized(I), cand_saving(I, B) }.
+#minimize { S@2, surcharge : any_callee_saved, cs_surcharge(S) }.
+#minimize { C@2, perreg, R : used_callee_saved(R), cs_per_reg(C) }.
 
 % ---- Optional pressure guardrail (disabled by default) --------------------
 % Pinning a vreg into GPRC removes one register from the GPR pool greedy sees,

@@ -10,37 +10,70 @@
 // RISC-V "C" extension.
 //
 // The 8 RVC-addressable registers x8-x15 (the GPRC class) are the scarce
-// resource: a compressed (16-bit) encoding of a reg-reg instruction is only
-// available when its operands live in GPRC.  This pass runs just before the
-// register allocator, models "which compression-candidate vregs should occupy
-// GPRC, so that the most candidates can be compressed" as an Answer Set
-// Programming optimization problem, solves it with Clingo, and records the
+// resource: a compressed (16-bit) encoding of a GPRC-requiring instruction is
+// only available when all of its register operands live in GPRC.  This pass
+// runs just before the register allocator, models "which compression-candidate
+// vregs should occupy GPRC so that the most candidates compress" as an Answer
+// Set Programming optimization problem, solves it with Clingo, and records the
 // resulting exact-colour choices as register-allocation hints
 // (MRI.addRegAllocationHint).  The greedy allocator (phase 2) then honours
 // those hints where register pressure allows and falls back to ordinary GPR
-// registers otherwise -- i.e. an instruction that cannot get GPRC simply stays
-// in its 32-bit form ("demoted"); no explicit spill machinery is needed.
+// registers otherwise -- an instruction that cannot get GPRC simply stays in
+// its 32-bit form ("demoted"); no explicit spill machinery is needed.
 //
-// This is the optimal counterpart to the heuristic GPRC hinting already done
-// in RISCVRegisterInfo::getRegAllocationHints().  It is gated behind
-// -riscv-asp-rvc-regalloc (off by default) and is a no-op when LLVM is built
-// without Clingo.
+// This is the optimal, global counterpart to the heuristic, per-vreg GPRC
+// hinting in RISCVRegisterInfo::getRegAllocationHints().
 //
-// Scope (first cut): GPRC-requiring reg-reg ALU instructions (AND/OR/XOR/SUB,
-// ADDW/SUBW, SRLI/SRAI, ANDI).  GPRC loads/stores (c.lw/c.sw/...) and the FP
-// compressed classes are deliberately left out for now -- they need immediate
-// range checks and a separate FP-compressed pool -- and are a localized
-// extension to collectGPRCOperands() / the register pool below.
+// Modelling notes
+// ---------------
+// * Two-address ALU ops (c.and/c.or/c.xor/c.sub/c.addw/c.subw and the Zcb
+//   unary/c.mul forms, plus c.andi/c.srli/c.srai) compress only when the
+//   destination and one source share a register (rd == rs1, or rd == rs2 for a
+//   commutable op).  This is expressed with a tied/2 fact: two tied vregs must
+//   occupy the same GPRC register or neither is placed.  Because a tied pair
+//   that interferes can never share a register, such a candidate is simply
+//   left un-realized -- exactly the cases where coalescing would have needed an
+//   extra copy.  The tied source is chosen (here, using liveness) to match the
+//   one the TwoAddressInstruction pass will pick, i.e. the source that dies at
+//   the instruction.
+// * Loads/stores (c.lw/c.sw, c.ld/c.sd, and the Zcb byte/half forms) need both
+//   their base and data operands in GPRC and a scaled immediate in range; they
+//   carry no tie.  These are not hinted by the in-tree heuristic at all, so
+//   they are pure additional compression opportunities.
+// * Callee-saved GPRC registers (x8/x9) cost a prologue save/restore when not
+//   otherwise used.  Rather than a fixed tie-break, the objective subtracts the
+//   *real* spill cost of touching them -- a one-time frame surcharge plus a
+//   per-register cost -- from the compression bytes saved, all at one priority
+//   level.  Those two weights (cs_surcharge/1, cs_per_reg/1) are emitted by the
+//   pass according to the active spill mechanism: an inline frame pays a real
+//   c.sdsp/c.ldsp pair per register, whereas the save-restore millicode and the
+//   Zcmp cm.push/cm.pop instructions amortize that to ~zero marginal cost.  So
+//   x10-x15 are preferred under an inline frame, while under Zcmp the pass will
+//   freely spend x8/x9 on extra compressions.
+// * ABI-pinned operands are modelled explicitly.  A vreg copied directly to/from
+//   a physical GPR (argument, return value, call operand) is almost always
+//   coalesced into that register, so the pass pins it: precolored/2 fixes a vreg
+//   already bound to a GPRC physreg, and pinned_nongprc/1 marks one bound to a
+//   non-GPRC physreg (x16/x17/t*, sp, ...) as un-placeable.  Without this the
+//   solver would plan placements -- e.g. pulling a 7th pointer argument out of
+//   x16 -- that the coalescer simply undoes, producing hints that mislead the
+//   greedy allocator into a *worse* result than no hints at all.
+//
+// Gated behind -riscv-asp-rvc-regalloc (off by default); a no-op when LLVM is
+// built without Clingo.
 //
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -66,6 +99,7 @@ using namespace llvm;
 #define RISCV_ASP_RVC_NAME "RISC-V ASP-driven RVC register allocation hints"
 
 STATISTIC(NumGPRCHints, "Number of GPRC allocation hints emitted by ASP");
+STATISTIC(NumCandidates, "Number of GPRC compression candidates seen by ASP");
 
 static cl::opt<bool> EnableASPRVCRegAlloc(
     "riscv-asp-rvc-regalloc", cl::Hidden, cl::init(false),
@@ -80,21 +114,57 @@ static cl::opt<unsigned> ASPRVCTimeLimitSecs(
 
 namespace {
 
-/// The static policy half of the phase-1 ASP program (mirrors the core of
+/// The static policy half of the phase-1 ASP program (mirrors
 /// ASP-PBQP-regalloc/regalloc_phase1_gprc.lp).  Dynamic facts -- gprc_reg/1,
-/// cand/1, cand_saving/2, needs_gprc/2, interfere/2 -- are appended per
-/// MachineFunction.
+/// gprc_callee_saved/1, cand/1, cand_saving/2, needs_gprc/2, tied/2,
+/// interfere/2 -- are appended per MachineFunction.
 const char *const kPhase1Prelude =
-    "% Phase-1 GPRC allocation: maximize realized RVC compressions.\n"
-    "gprc_vreg(V) :- needs_gprc(_, V).\n"
+    "% Phase-1 GPRC allocation: globally maximize realized RVC compressions,\n"
+    "% then prefer caller-saved GPRC registers.\n"
+    "% A vreg is a free GPRC-placement candidate unless ABI-pinned: pinned to a\n"
+    "% GPRC physreg (precolored/2, fixed there) or to a non-GPRC physreg\n"
+    "% (pinned_nongprc/1, can never be GPRC -> its candidates are blocked).\n"
+    "gprc_vreg(V) :- needs_gprc(_, V), not precolored(V, _), "
+    "not pinned_nongprc(V).\n"
+    "\n"
+    "% Symmetric closure of the two-address tie relation.\n"
+    "tied_sym(A, B) :- tied(A, B).\n"
+    "tied_sym(A, B) :- tied(B, A).\n"
+    "\n"
+    "% Each candidate vreg occupies at most one GPRC register.\n"
     "{ in_gprc(V, R) : gprc_reg(R) } 1 :- gprc_vreg(V).\n"
+    "% ABI-pinned GPRC operands are fixed to their physical register.\n"
+    "in_gprc(V, R) :- precolored(V, R).\n"
     "in_gprc(V) :- in_gprc(V, _).\n"
-    "% No two simultaneously-live vregs in the same GPRC register.\n"
+    "\n"
+    "% No two simultaneously-live vregs share a GPRC register.\n"
     ":- in_gprc(V1, R), in_gprc(V2, R), interfere(V1, V2).\n"
-    "% A candidate compresses only if all its required operands got GPRC.\n"
+    "\n"
+    "% Two-address operands share one GPRC register (coalesced) or neither is\n"
+    "% placed.  With interference, a pair that cannot coalesce for free is\n"
+    "% never placed -> its candidate is demoted.\n"
+    ":- tied_sym(V1, V2), in_gprc(V1, R), not in_gprc(V2, R).\n"
+    "\n"
+    "% A candidate compresses only if every required operand is in GPRC.\n"
     "blocked(I) :- needs_gprc(I, V), not in_gprc(V).\n"
     "realized(I) :- cand(I), not blocked(I).\n"
-    "#maximize { B@1, I : realized(I), cand_saving(I, B) }.\n"
+    "\n"
+    "% Distinct callee-saved GPRC registers touched.  Touching any incurs a\n"
+    "% one-time frame surcharge (cs_surcharge/1); each one also costs cs_per_reg/1.\n"
+    "% Both weights are supplied by the pass in the same byte unit as\n"
+    "% cand_saving and reflect the active spill mechanism: an inline frame pays\n"
+    "% a real save/restore per register, whereas save-restore millicode and\n"
+    "% Zcmp cm.push/cm.pop amortize that to near zero marginal cost.\n"
+    "used_callee_saved(R) :- in_gprc(_, R), gprc_callee_saved(R).\n"
+    "any_callee_saved :- used_callee_saved(_).\n"
+    "\n"
+    "% Objective (single @2 level): maximize realized compression bytes minus\n"
+    "% the true spill cost of any callee-saved GPRC registers touched, so a\n"
+    "% candidate is realized only when its saving exceeds the spill it forces.\n"
+    "#maximize { B@2, realized, I : realized(I), cand_saving(I, B) }.\n"
+    "#minimize { S@2, surcharge : any_callee_saved, cs_surcharge(S) }.\n"
+    "#minimize { C@2, perreg, R : used_callee_saved(R), cs_per_reg(C) }.\n"
+    "\n"
     "#show in_gprc/2.\n";
 
 class RISCVRVCRegAllocHints : public MachineFunctionPass {
@@ -115,41 +185,113 @@ public:
   StringRef getPassName() const override { return RISCV_ASP_RVC_NAME; }
 };
 
-/// Return the operand indices of \p MI that must be allocated to GPRC for the
-/// instruction to have a compressed (16-bit) encoding, or an empty vector if
-/// MI is not a GPRC-requiring compression candidate.
-///
-/// Mirrors the NeedGPRC cases of RISCVRegisterInfo::getRegAllocationHints'
-/// isCompressible helper.  All listed forms are two-address ALU ops, so their
-/// register operands are GPR-class -- every GPRC register is a legal colour and
-/// no per-vreg allowed/2 filtering is required.
-SmallVector<unsigned, 3> collectGPRCOperands(const MachineInstr &MI,
-                                             const RISCVSubtarget &ST) {
+/// Shape of a GPRC compression candidate.
+enum CandKind {
+  CK_None,      ///< not a GPRC-requiring compression candidate.
+  CK_LoadStore, ///< {data=op0, base=op1} both GPRC, no tie.
+  CK_TwoOp,     ///< {rd=op0, rs1=op1} both GPRC, tie rd~rs1.
+  CK_RR3        ///< {rd=op0, rs1=op1, rs2=op2} all GPRC, tie rd~dying source.
+};
+
+/// Classify \p MI as a GPRC-requiring compression candidate, applying the same
+/// opcode/immediate tests as RISCVRegisterInfo::getRegAllocationHints plus the
+/// GPRC loads/stores.  \p Commutable is set for reg-reg ALU ops whose tie may
+/// target either source.
+CandKind classifyCompressible(const MachineInstr &MI, const RISCVSubtarget &ST,
+                              bool &Commutable) {
+  Commutable = false;
+  auto immInRange = [&](unsigned OpNo, auto Pred) -> bool {
+    return MI.getOperand(OpNo).isImm() &&
+           Pred(static_cast<int64_t>(MI.getOperand(OpNo).getImm()));
+  };
+
   switch (MI.getOpcode()) {
   default:
-    return {};
+    return CK_None;
+
+  // --- GPRC loads (data=rd=op0, base=rs1=op1, off=op2) -------------------
+  case RISCV::LW:
+    return immInRange(2, [](int64_t I) { return isShiftedUInt<5, 2>(I); })
+               ? CK_LoadStore
+               : CK_None;
+  case RISCV::LD:
+    return immInRange(2, [](int64_t I) { return isShiftedUInt<5, 3>(I); })
+               ? CK_LoadStore
+               : CK_None;
+  case RISCV::LBU:
+    return ST.hasStdExtZcb() &&
+                   immInRange(2, [](int64_t I) { return isUInt<2>(I); })
+               ? CK_LoadStore
+               : CK_None;
+  case RISCV::LH:
+  case RISCV::LHU:
+    return ST.hasStdExtZcb() &&
+                   immInRange(2, [](int64_t I) { return isShiftedUInt<1, 1>(I); })
+               ? CK_LoadStore
+               : CK_None;
+
+  // --- GPRC stores (data=rs2=op0, base=rs1=op1, off=op2) -----------------
+  case RISCV::SW:
+    return immInRange(2, [](int64_t I) { return isShiftedUInt<5, 2>(I); })
+               ? CK_LoadStore
+               : CK_None;
+  case RISCV::SD:
+    return immInRange(2, [](int64_t I) { return isShiftedUInt<5, 3>(I); })
+               ? CK_LoadStore
+               : CK_None;
+  case RISCV::SB:
+    return ST.hasStdExtZcb() &&
+                   immInRange(2, [](int64_t I) { return isUInt<2>(I); })
+               ? CK_LoadStore
+               : CK_None;
+  case RISCV::SH:
+    return ST.hasStdExtZcb() &&
+                   immInRange(2, [](int64_t I) { return isShiftedUInt<1, 1>(I); })
+               ? CK_LoadStore
+               : CK_None;
+
+  // --- reg-reg ALU: rd, rs1, rs2 all GPRC, two-address -------------------
   case RISCV::AND:
   case RISCV::OR:
   case RISCV::XOR:
-  case RISCV::SUB:
   case RISCV::ADDW:
+    Commutable = true;
+    return CK_RR3;
+  case RISCV::SUB:
   case RISCV::SUBW:
-    // c.and / c.or / c.xor / c.sub / c.addw / c.subw : rd, rs1, rs2 all GPRC.
-    return {0, 1, 2};
+    return CK_RR3;
+  case RISCV::MUL: // c.mul (Zcb)
+    if (!ST.hasStdExtZcb())
+      return CK_None;
+    Commutable = true;
+    return CK_RR3;
+
+  // --- reg-imm / unary ALU: rd, rs1 GPRC, tie rd~rs1 ---------------------
+  case RISCV::ANDI:
+    if (immInRange(2, [](int64_t I) { return isInt<6>(I); }))
+      return CK_TwoOp;
+    // c.zext.b
+    if (ST.hasStdExtZcb() && immInRange(2, [](int64_t I) { return I == 255; }))
+      return CK_TwoOp;
+    return CK_None;
   case RISCV::SRAI:
   case RISCV::SRLI:
-    // c.srai / c.srli : rd, rs1 GPRC (shift amount is an immediate).
-    return {0, 1};
-  case RISCV::ANDI: {
-    // c.andi : rd, rs1 GPRC, with a sign-extended 6-bit immediate (or the
-    // Zcb c.zext.b form, imm == 255).
-    if (!MI.getOperand(2).isImm())
-      return {};
-    int64_t Imm = MI.getOperand(2).getImm();
-    if (isInt<6>(Imm) || (ST.hasStdExtZcb() && Imm == 255))
-      return {0, 1};
-    return {};
-  }
+    return CK_TwoOp;
+  case RISCV::SEXT_B:
+  case RISCV::SEXT_H:
+  case RISCV::ZEXT_H_RV32:
+  case RISCV::ZEXT_H_RV64:
+    return ST.hasStdExtZcb() ? CK_TwoOp : CK_None; // c.sext.*/c.zext.h
+  case RISCV::ADD_UW:                              // c.zext.w
+    return ST.hasStdExtZcb() && MI.getOperand(2).isReg() &&
+                   MI.getOperand(2).getReg() == RISCV::X0
+               ? CK_TwoOp
+               : CK_None;
+  case RISCV::XORI: // c.not
+    return ST.hasStdExtZcb() &&
+                   immInRange(2, [](int64_t I) { return I == -1; })
+               ? CK_TwoOp
+               : CK_None;
   }
 }
 
@@ -259,6 +401,7 @@ bool runPhase1Clingo(const std::string &Program,
 } // end anonymous namespace
 
 char RISCVRVCRegAllocHints::ID = 0;
+
 INITIALIZE_PASS_BEGIN(RISCVRVCRegAllocHints, DEBUG_TYPE, RISCV_ASP_RVC_NAME,
                       false, false)
 INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
@@ -283,7 +426,6 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
   // Dense id for each candidate vreg; the id is what appears in ASP facts.
   DenseMap<Register, unsigned> VRegId;
   std::vector<Register> IdToVReg;
-
   auto getId = [&](Register R) -> unsigned {
     auto It = VRegId.find(R);
     if (It != VRegId.end())
@@ -294,63 +436,203 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
     return Id;
   };
 
+  // A vreg operand is usable iff it has a live interval and a register class
+  // that admits GPRC (can hold x10).  A GPRC physreg operand is already
+  // satisfied; any other physreg makes the instruction un-compressible.
+  enum OpState { OS_Vreg, OS_FixedGPRC, OS_Reject };
+  auto classifyOp = [&](const MachineOperand &MO) -> OpState {
+    if (!MO.isReg())
+      return OS_Reject;
+    Register Reg = MO.getReg();
+    if (Reg.isPhysical())
+      return RISCV::GPRCRegClass.contains(Reg) ? OS_FixedGPRC : OS_Reject;
+    if (!LIS.hasInterval(Reg) || !MRI.getRegClass(Reg)->contains(RISCV::X10))
+      return OS_Reject;
+    return OS_Vreg;
+  };
+
+  auto overlaps = [&](Register A, Register B) -> bool {
+    return LIS.getInterval(A).overlaps(LIS.getInterval(B));
+  };
+
+  // ABI affinity: a virtual register copied directly to or from a physical GPR
+  // is almost always coalesced into that physical register (function arguments,
+  // return values, call operands).  Treat such a vreg as pinned to that physreg
+  // so the model never plans a GPRC placement the coalescer will simply undo --
+  // e.g. trying to pull a 7th pointer argument (a6/x16) into GPRC.  A vreg with
+  // conflicting affinities (copied to two different physregs) is left unpinned.
+  DenseMap<Register, Register> AbiPhys;
+  DenseSet<Register> AbiAmbiguous;
+  auto noteAbi = [&](Register VReg, Register Phys) {
+    if (AbiAmbiguous.count(VReg))
+      return;
+    auto It = AbiPhys.find(VReg);
+    if (It == AbiPhys.end())
+      AbiPhys[VReg] = Phys;
+    else if (It->second != Phys) {
+      AbiAmbiguous.insert(VReg);
+      AbiPhys.erase(It);
+    }
+  };
+  for (const MachineBasicBlock &MBB : MF)
+    for (const MachineInstr &MI : MBB) {
+      if (!MI.isCopy())
+        continue;
+      Register Dst = MI.getOperand(0).getReg();
+      Register Src = MI.getOperand(1).getReg();
+      if (Dst.isVirtual() && Src.isPhysical() &&
+          RISCV::GPRRegClass.contains(Src))
+        noteAbi(Dst, Src);
+      else if (Src.isVirtual() && Dst.isPhysical() &&
+               RISCV::GPRRegClass.contains(Dst))
+        noteAbi(Src, Dst);
+    }
+
   std::ostringstream Facts;
   unsigned NextCand = 0;
-  bool AnyCandidate = false;
 
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
-      SmallVector<unsigned, 3> OpIdxs = collectGPRCOperands(MI, ST);
-      if (OpIdxs.empty())
+      bool Commutable = false;
+      CandKind Kind = classifyCompressible(MI, ST, Commutable);
+      if (Kind == CK_None)
         continue;
 
-      // Gather the virtual-register operands that must be GPRC. If any required
-      // operand is a physical register outside GPRC, the instruction can never
-      // compress -- skip it entirely.
-      SmallVector<Register, 3> Needs;
-      bool Compressible = true;
+      // Operand indices that must be in GPRC for this candidate.
+      SmallVector<unsigned, 3> OpIdxs;
+      if (Kind == CK_RR3)
+        OpIdxs = {0, 1, 2};
+      else
+        OpIdxs = {0, 1}; // CK_LoadStore and CK_TwoOp.
+
+      // Collect the virtual-register operands that need GPRC; reject the whole
+      // candidate if any required operand can never be GPRC.
+      SmallVector<Register, 3> VRegs;     // virtual operands needing GPRC
+      bool Ok = true;
       for (unsigned Idx : OpIdxs) {
-        const MachineOperand &MO = MI.getOperand(Idx);
-        if (!MO.isReg()) {
-          Compressible = false;
+        switch (classifyOp(MI.getOperand(Idx))) {
+        case OS_Reject:
+          Ok = false;
+          break;
+        case OS_FixedGPRC:
+          continue; // already GPRC; not an allocation choice.
+        case OS_Vreg:
+          VRegs.push_back(MI.getOperand(Idx).getReg());
           break;
         }
-        Register Reg = MO.getReg();
-        if (Reg.isPhysical()) {
-          if (!RISCV::GPRCRegClass.contains(Reg)) {
-            Compressible = false;
-            break;
-          }
-          continue; // already a fixed GPRC physreg; not an allocation choice.
-        }
-        // Virtual: must have a live interval and a class that admits GPRC.
-        if (!LIS.hasInterval(Reg) ||
-            !MRI.getRegClass(Reg)->contains(RISCV::X10)) {
-          Compressible = false;
+        if (!Ok)
           break;
-        }
-        Needs.push_back(Reg);
       }
-      if (!Compressible || Needs.empty())
+      if (!Ok || VRegs.empty())
         continue;
+
+      // Determine the tie (two-address) pair, if any.  CK_TwoOp ties rd(0) to
+      // rs1(1).  CK_RR3 ties rd(0) to whichever source dies here (matching the
+      // commutation the TwoAddressInstruction pass will choose); if neither
+      // source dies the pair cannot coalesce for free and the resulting
+      // tied+interfering facts leave the candidate un-realized.
+      Register TieA, TieB;
+      if (Kind == CK_TwoOp || Kind == CK_RR3) {
+        Register Rd = MI.getOperand(0).getReg();
+        Register Rs1 = MI.getOperand(1).getReg();
+        if (Rd.isVirtual()) {
+          if (Kind == CK_TwoOp) {
+            if (Rs1.isVirtual()) {
+              TieA = Rd;
+              TieB = Rs1;
+            }
+          } else {
+            Register Rs2 = MI.getOperand(2).getReg();
+            Register Partner;
+            if (Rs1.isVirtual() && !overlaps(Rd, Rs1))
+              Partner = Rs1;
+            else if (Commutable && Rs2.isVirtual() && !overlaps(Rd, Rs2))
+              Partner = Rs2;
+            else if (Rs1.isVirtual())
+              Partner = Rs1; // will be blocked via interference (no free tie).
+            if (Partner) {
+              TieA = Rd;
+              TieB = Partner;
+            }
+          }
+        }
+      }
 
       unsigned CandId = NextCand++;
+      ++NumCandidates;
       Facts << "cand(i" << CandId << "). cand_saving(i" << CandId << ", 2).";
-      for (Register Reg : Needs)
+      for (Register Reg : VRegs)
         Facts << " needs_gprc(i" << CandId << ", " << getId(Reg) << ").";
       Facts << "\n";
-      AnyCandidate = true;
+      if (TieA && TieB)
+        Facts << "tied(" << getId(TieA) << ", " << getId(TieB) << ").\n";
     }
   }
 
-  if (!AnyCandidate)
+  if (NextCand == 0)
     return false;
 
-  // Build the GPRC physical-register pool: index i -> GPRCRegs[i].
+  // GPRC physical-register pool: index i -> GPRCRegs[i].  Mark the
+  // callee-saved members (x8/x9 under the standard ABI) for the tie-breaker.
   std::vector<MCPhysReg> GPRCRegs(RISCV::GPRCRegClass.begin(),
                                   RISCV::GPRCRegClass.end());
-  for (unsigned I = 0, E = GPRCRegs.size(); I != E; ++I)
+  const MCPhysReg *CSR = MRI.getCalleeSavedRegs();
+  auto isCalleeSaved = [&](MCPhysReg Reg) {
+    for (const MCPhysReg *P = CSR; P && *P; ++P)
+      if (*P == Reg)
+        return true;
+    return false;
+  };
+  for (unsigned I = 0, E = GPRCRegs.size(); I != E; ++I) {
     Facts << "gprc_reg(" << I << ").\n";
+    if (isCalleeSaved(GPRCRegs[I]))
+      Facts << "gprc_callee_saved(" << I << ").\n";
+  }
+
+  // ABI-pinned candidate operands.  A vreg pinned to a GPRC physreg is fixed
+  // there (precolored/2); one pinned to a non-GPRC physreg can never compress
+  // its candidates (pinned_nongprc/1).  This keeps the solver from planning
+  // placements the register coalescer will override.
+  auto gprcPoolIndex = [&](Register Phys) -> int {
+    for (unsigned I = 0, N = GPRCRegs.size(); I != N; ++I)
+      if (Register(GPRCRegs[I]) == Phys)
+        return (int)I;
+    return -1;
+  };
+  for (unsigned Id = 0, E = IdToVReg.size(); Id < E; ++Id) {
+    auto It = AbiPhys.find(IdToVReg[Id]);
+    if (It == AbiPhys.end())
+      continue;
+    int Pool = gprcPoolIndex(It->second);
+    if (Pool >= 0)
+      Facts << "precolored(" << Id << ", " << Pool << ").\n";
+    else
+      Facts << "pinned_nongprc(" << Id << ").\n";
+  }
+
+  // Spill-cost weights for callee-saved GPRC use, in bytes (same unit as
+  // cand_saving = 2).  Surcharge is paid once if any callee-saved register is
+  // touched; per-reg is paid for each.  The values track the active spill
+  // mechanism's *marginal* code-size cost:
+  //   * Zcmp (cm.push/cm.pop): one tiny pushed/popped list covers the whole
+  //     callee-saved range, so adding a register is essentially free.
+  //   * save-restore millicode: a fixed call/tail into shared routines, with
+  //     ~zero marginal cost per extra register saved by that routine.
+  //   * inline frame (default): real c.addi16sp frame setup plus a
+  //     c.sdsp/c.ldsp pair per register.
+  unsigned CsSurcharge, CsPerReg;
+  if (ST.hasStdExtZcmp()) {
+    CsSurcharge = 2;
+    CsPerReg = 0;
+  } else if (ST.enableSaveRestore()) {
+    CsSurcharge = 8;
+    CsPerReg = 0;
+  } else {
+    CsSurcharge = 4;
+    CsPerReg = 4;
+  }
+  Facts << "cs_surcharge(" << CsSurcharge << ").\n";
+  Facts << "cs_per_reg(" << CsPerReg << ").\n";
 
   // Interference among candidate vregs (emit each pair once, V1 < V2).
   for (unsigned A = 0, N = IdToVReg.size(); A < N; ++A)
@@ -370,8 +652,13 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
     return false;
   }
 
+  // Apply one hint per assigned vreg.  Tied vregs are given the same register
+  // by the solver, so coalescing falls out automatically.
+  DenseSet<unsigned> Hinted;
   for (auto [VIdx, RIdx] : Assignment) {
     if (VIdx >= IdToVReg.size() || RIdx >= GPRCRegs.size())
+      continue;
+    if (!Hinted.insert(VIdx).second)
       continue;
     Register VReg = IdToVReg[VIdx];
     MCPhysReg PhysReg = GPRCRegs[RIdx];
