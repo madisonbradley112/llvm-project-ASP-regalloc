@@ -56,6 +56,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <queue>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #ifdef LLVM_PBQP_HAVE_CLINGO
@@ -124,7 +125,12 @@ public:
   void releaseMemory() override { SpillerInstance.reset(); }
 
   Spiller &spiller() override { return *SpillerInstance; }
-  void enqueueImpl(const LiveInterval *LI) override { Queue.push(LI); }
+  // Skip vregs already placed by the ASP pre-seeding step, so the global
+  // coloring is realized exactly instead of being re-derived per vreg.
+  void enqueueImpl(const LiveInterval *LI) override {
+    if (!VRM->hasPhys(LI->reg()))
+      Queue.push(LI);
+  }
   const LiveInterval *dequeue() override {
     if (Queue.empty())
       return nullptr;
@@ -314,6 +320,22 @@ bool RISCVASPRegAlloc::runOnMachineFunction(MachineFunction &mf) {
   ASPChoice.clear();
   solveASP();
 
+  // Pre-seed the solver's coloring directly into the matrix, so the global
+  // assignment is realized exactly rather than re-derived one vreg at a time
+  // (which lets earlier vregs steal registers a later vreg's choice wanted,
+  // forcing shuffle moves).  Only place a choice that is legal for the vreg's
+  // class and currently interference-free; the rest go through allocatePhysRegs.
+  for (auto &[VReg, PhysReg] : ASPChoice) {
+    if (!MRI->reg_nodbg_empty(VReg) && !VRM->hasPhys(VReg) &&
+        MRI->getRegClass(VReg)->contains(PhysReg)) {
+      LiveInterval &LI = LIS->getInterval(VReg);
+      if (Matrix->checkInterference(LI, PhysReg) == LiveRegMatrix::IK_Free) {
+        Matrix->assign(LI, PhysReg);
+        ++NumASPAssigned;
+      }
+    }
+  }
+
   allocatePhysRegs();
   postOptimization();
   releaseMemory();
@@ -337,7 +359,19 @@ static const char *const kASPModel =
     "gprc_ok(V) :- assign(V, R), gprc(R).\n"
     "blocked(I) :- needs_gprc(I, V), not gprc_ok(V).\n"
     "realized(I) :- cand(I), not blocked(I).\n"
+    "% A copy is eliminated when its two ends land in the same register: a vreg\n"
+    "% pinned to the physical register it is copied to/from (ABI args/returns),\n"
+    "% or two copy-related vregs sharing a register.  Each saves its bytes.\n"
+    "coalesced(C) :- copy_phys(C, V, R), assign(V, R).\n"
+    "coalesced(C) :- copy_v(C, V1, V2), assign(V1, R), assign(V2, R).\n"
+    "% Using a callee-saved register forces a prologue save/restore: charge\n"
+    "% cs_cost bytes per distinct callee-saved register touched.\n"
+    "used_cs(R) :- assign(_, R), callee_saved(R).\n"
+    "% Objective (bytes): realized compressions plus eliminated copies, minus\n"
+    "% the save/restore cost of any callee-saved registers used.\n"
     "#maximize { B@1, realized, I : realized(I), cand_save(I, B) }.\n"
+    "#maximize { B@1, coalesced, C : coalesced(C), copy_save(C, B) }.\n"
+    "#minimize { N@1, cs, R : used_cs(R), cs_cost(N) }.\n"
     "#show assign/2.\n";
 
 static bool parseAssignAtom(clingo_symbol_t Sym, unsigned &V, unsigned &R) {
@@ -552,15 +586,58 @@ void RISCVASPRegAlloc::solveASP() {
         Cands.emplace_back(&MI, std::move(Need));
     }
 
+  // Copies: a vreg copied to/from an allocatable physreg (ABI args/returns) or
+  // another vreg can be elided if both ends share a register.  Model them so
+  // the solver co-locates them (coalescing), traded against compression.  Copy
+  // operands are added to the vreg set even if they are not candidates.
+  std::vector<std::tuple<bool, unsigned, unsigned>> Copies; // (phys, A, B)
+  for (const MachineBasicBlock &MBB : *MF)
+    for (const MachineInstr &MI : MBB) {
+      if (!MI.isCopy())
+        continue;
+      Register Dst = MI.getOperand(0).getReg();
+      Register Src = MI.getOperand(1).getReg();
+      if (Dst.isVirtual() && Src.isPhysical()) {
+        auto RIt = RegId.find(Src);
+        int V = getVId(Dst);
+        if (RIt != RegId.end() && V >= 0)
+          Copies.emplace_back(true, (unsigned)V, RIt->second);
+      } else if (Src.isVirtual() && Dst.isPhysical()) {
+        auto RIt = RegId.find(Dst);
+        int V = getVId(Src);
+        if (RIt != RegId.end() && V >= 0)
+          Copies.emplace_back(true, (unsigned)V, RIt->second);
+      } else if (Dst.isVirtual() && Src.isVirtual()) {
+        int A = getVId(Dst), B = getVId(Src);
+        if (A >= 0 && B >= 0 && A != B)
+          Copies.emplace_back(false, (unsigned)A, (unsigned)B);
+      }
+    }
+
   if (IdToVReg.empty() || IdToVReg.size() > ASPCSMaxVRegs)
     return; // nothing to do, or too large to color combinatorially.
 
+  // Callee-saved membership for the pool registers.
+  const MCPhysReg *CSR = MRI->getCalleeSavedRegs();
+  auto isCalleeSaved = [&](MCPhysReg R) {
+    for (const MCPhysReg *P = CSR; P && *P; ++P)
+      if (*P == R)
+        return true;
+    return false;
+  };
   for (unsigned I = 0; I < Pool.size(); ++I) {
     F << "reg(" << I << ").";
     if (RISCV::GPRCRegClass.contains(Pool[I]))
       F << " gprc(" << I << ").";
+    if (isCalleeSaved(Pool[I]))
+      F << " callee_saved(" << I << ").";
     F << "\n";
   }
+  // Per-callee-saved-register cost (bytes), feature-aware: a save/restore pair
+  // is cheap when amortized by Zcmp cm.push/pop or the save-restore millicode,
+  // but a real c.sdsp/c.ldsp pair (plus frame setup) under an inline frame.
+  unsigned CsCost = (ST.hasStdExtZcmp() || ST.enableSaveRestore()) ? 1 : 4;
+  F << "cs_cost(" << CsCost << ").\n";
   for (unsigned I = 0; I < IdToVReg.size(); ++I)
     F << "vreg(" << I << ").\n";
   for (unsigned A = 0; A < IdToVReg.size(); ++A)
@@ -574,6 +651,12 @@ void RISCVASPRegAlloc::solveASP() {
       F << " needs_gprc(i" << CandId << ", " << VRegId[R] << ").";
     F << "\n";
     ++CandId;
+  }
+  unsigned CopyId = 0;
+  for (auto &[Phys, A, B] : Copies) {
+    F << (Phys ? "copy_phys(c" : "copy_v(c") << CopyId << ", " << A << ", " << B
+      << "). copy_save(c" << CopyId << ", 2).\n";
+    ++CopyId;
   }
 
   std::string Program = std::string(kASPModel) + F.str();
