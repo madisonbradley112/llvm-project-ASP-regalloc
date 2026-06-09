@@ -73,6 +73,7 @@
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
@@ -88,6 +89,8 @@
 #include <thread>
 #endif
 
+#include <algorithm>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -111,6 +114,66 @@ static cl::opt<bool> EnableASPRVCRegAlloc(
 static cl::opt<unsigned> ASPRVCTimeLimitSecs(
     "riscv-asp-rvc-time-limit", cl::Hidden, cl::init(10),
     cl::desc("Clingo time limit (seconds) for the phase-1 GPRC solve"));
+
+// Contention gate: a compression candidate is only modelled/hinted when one of
+// its GPRC operands competes with at least this many other candidate operands
+// (interference degree).  Below it, GPRC is uncontended and greedy already
+// compresses the instruction unaided, so a hint would be inframarginal and only
+// perturb the allocator.  Default ~ the GPRC pool size, so the pass intervenes
+// only once demand approaches the eight x8-x15 registers.
+static cl::opt<unsigned> RVCMinPressure(
+    "riscv-asp-rvc-min-pressure", cl::Hidden, cl::init(8),
+    cl::desc("Minimum GPRC interference degree for the ASP pass to hint a "
+             "compression candidate"));
+
+// Binding channel: when set, the solver's chosen GPRC register for a candidate
+// vreg is *bound* by constraining the vreg to that single-register class (the
+// allocator must use it or spill), instead of emitting a soft preference the
+// greedy allocator may ignore.  The model is call-aware so a bound placement
+// never forces a spill around a call.  Set to false to fall back to soft hints.
+static cl::opt<bool> RVCBindHints(
+    "riscv-asp-rvc-bind", cl::Hidden, cl::init(true),
+    cl::desc("Bind the ASP GPRC assignment via register-class constraints "
+             "instead of soft allocation hints"));
+
+// Experimental GPRC-occupancy cap (off by default): at any program point place
+// at most (GPRC pool size - this) candidates in GPRC.  This proved a poor lever
+// -- denying a candidate GPRC does not free a register (it still occupies a
+// non-GPRC GPR), so the cap loses compressions without relieving pressure.  The
+// register-pressure gate below is the effective mechanism.  Kept as a knob.
+static cl::opt<unsigned> RVCHeadroom(
+    "riscv-asp-rvc-headroom", cl::Hidden, cl::init(0),
+    cl::desc("GPRC registers to leave free for non-candidate values at each "
+             "program point (0 = no occupancy cap)"));
+
+// Register-pressure gate: if the function's peak GPR live-range pressure exceeds
+// this, it is already register-bound and will spill regardless; forcing values
+// into the 8-register GPRC subset there only over-subscribes it and adds spill
+// traffic.  Skip such functions entirely (leave them to greedy).  Functions with
+// pressure below the bar have spare registers, so forcing candidates into GPRC
+// displaces nothing and is a clean compression win.
+static cl::opt<unsigned> RVCMaxPressure(
+    "riscv-asp-rvc-max-pressure", cl::Hidden, cl::init(26),
+    cl::desc("Skip the ASP pass in functions whose peak GPR register pressure "
+             "exceeds this (already register-bound; intervention backfires)"));
+
+// Per-candidate spill cost folded into the objective.  Placing a vreg in GPRC
+// at a program point where GPR pressure is at/above RVCSpillThreshold restricts
+// it to the 8-register GPRC subset where there is no room, which forces a spill
+// of some value -- a code-size cost the model must weigh against the 2-byte
+// compression.  RVCSpillWeight is that cost in bytes (a store + reload); 0
+// disables it.  Unlike the coarse gate, this lets a partially-pressured
+// function still compress its low-pressure regions while declining the
+// saturated ones.
+static cl::opt<unsigned> RVCSpillWeight(
+    "riscv-asp-rvc-spill-weight", cl::Hidden, cl::init(0),
+    cl::desc("Byte cost charged in the objective for placing a candidate in "
+             "GPRC within a register-saturated region (0 = disabled)"));
+
+static cl::opt<unsigned> RVCSpillThreshold(
+    "riscv-asp-rvc-spill-threshold", cl::Hidden, cl::init(26),
+    cl::desc("GPR pressure at/above which placing a candidate in GPRC is "
+             "charged the spill weight"));
 
 namespace {
 
@@ -145,6 +208,21 @@ const char *const kPhase1Prelude =
     "% never placed -> its candidate is demoted.\n"
     ":- tied_sym(V1, V2), in_gprc(V1, R), not in_gprc(V2, R).\n"
     "\n"
+    "% A vreg that is live across a call cannot occupy a caller-saved GPRC\n"
+    "% register (x10-x15 are clobbered by the call); it may only use a\n"
+    "% callee-saved GPRC register (x8/x9), which is preserved across the call.\n"
+    "% This keeps a *bound* placement from forcing a spill/reload around a call.\n"
+    ":- in_gprc(V, R), live_across_call(V), gprc_reg(R), "
+    "not gprc_callee_saved(R).\n"
+    "\n"
+    "% GPRC-occupancy headroom: at each high-pressure program point P, place at\n"
+    "% most gprc_cap(K) candidates in GPRC, reserving the rest of x8-x15 for the\n"
+    "% values phase-1 does not model (addresses, non-candidates).  point/1 and\n"
+    "% at/2 give the candidate vregs live at P.  This stops a bound placement\n"
+    "% from monopolizing GPRC and evicting those values to the stack.\n"
+    ":- point(P), gprc_cap(K), "
+    "C = #count { V : in_gprc(V), at(P, V) }, C > K.\n"
+    "\n"
     "% A candidate compresses only if every required operand is in GPRC.\n"
     "blocked(I) :- needs_gprc(I, V), not in_gprc(V).\n"
     "realized(I) :- cand(I), not blocked(I).\n"
@@ -164,6 +242,10 @@ const char *const kPhase1Prelude =
     "#maximize { B@2, realized, I : realized(I), cand_saving(I, B) }.\n"
     "#minimize { S@2, surcharge : any_callee_saved, cs_surcharge(S) }.\n"
     "#minimize { C@2, perreg, R : used_callee_saved(R), cs_per_reg(C) }.\n"
+    "% Per-candidate spill cost: placing a vreg in GPRC inside a register-\n"
+    "% saturated region forces a spill of some value -- charge it in bytes so\n"
+    "% the model only does so when the compression it enables is worth more.\n"
+    "#minimize { S@2, spill, V : in_gprc(V), cand_spill_cost(V, S) }.\n"
     "\n"
     "#show in_gprc/2.\n";
 
@@ -316,13 +398,18 @@ bool parseInGprcAtom(clingo_symbol_t Sym, unsigned &V, unsigned &R) {
   return true;
 }
 
+/// Drop Clingo's grounder/solver diagnostics (e.g. "atom does not occur in any
+/// rule head" for predicates a given function emits no facts for) instead of
+/// letting them leak onto the compiler's stderr.
+void clingoSilentLogger(clingo_warning_t, char const *, void *) {}
+
 /// Solve \p Program with Clingo and return the best in_gprc/2 assignment.
 /// Returns false (no hints) on UNSAT, time-out before any model, or error.
 bool runPhase1Clingo(const std::string &Program,
                      std::vector<std::pair<unsigned, unsigned>> &Out) {
   clingo_control_t *Ctl = nullptr;
   char const *Args[] = {"--opt-mode=opt"};
-  if (!clingo_control_new(Args, 1, nullptr, nullptr, 20, &Ctl))
+  if (!clingo_control_new(Args, 1, clingoSilentLogger, nullptr, 20, &Ctl))
     return false;
 
   auto Cleanup = [&]() { clingo_control_free(Ctl); };
@@ -488,8 +575,12 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
         noteAbi(Src, Dst);
     }
 
-  std::ostringstream Facts;
-  unsigned NextCand = 0;
+  // ---- Collect candidates (facts emitted later, after contention filtering).
+  struct Cand {
+    SmallVector<unsigned, 3> Needs; // dense ids of operands that need GPRC
+    int TieA = -1, TieB = -1;       // two-address tie pair, if any
+  };
+  std::vector<Cand> Cands;
 
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
@@ -558,19 +649,134 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
         }
       }
 
-      unsigned CandId = NextCand++;
-      ++NumCandidates;
-      Facts << "cand(i" << CandId << "). cand_saving(i" << CandId << ", 2).";
+      Cand C;
       for (Register Reg : VRegs)
-        Facts << " needs_gprc(i" << CandId << ", " << getId(Reg) << ").";
-      Facts << "\n";
-      if (TieA && TieB)
-        Facts << "tied(" << getId(TieA) << ", " << getId(TieB) << ").\n";
+        C.Needs.push_back(getId(Reg));
+      if (TieA && TieB) {
+        C.TieA = (int)getId(TieA);
+        C.TieB = (int)getId(TieB);
+      }
+      Cands.push_back(std::move(C));
+      ++NumCandidates;
     }
   }
 
-  if (NextCand == 0)
+  if (Cands.empty())
     return false;
+
+  // ---- GPR register-pressure model ----------------------------------------
+  // The set of GPR-class virtual registers, and a helper giving the number of
+  // them live at a slot (the GPR register pressure at that program point).
+  // This drives two things: a coarse function-level gate, and the per-candidate
+  // spill cost folded into the ASP objective below.
+  SmallVector<Register, 256> GPRVRegs;
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (LIS.hasInterval(R) && MRI.getRegClass(R)->contains(RISCV::X10))
+      GPRVRegs.push_back(R);
+  }
+  auto pressureAt = [&](SlotIndex S) -> unsigned {
+    unsigned N = 0;
+    for (Register R : GPRVRegs)
+      if (LIS.getInterval(R).liveAt(S))
+        ++N;
+    return N;
+  };
+  // Max GPR pressure over a vreg's live range (sampled at segment starts, where
+  // pressure peaks since a new value is added there).
+  auto maxPressureOver = [&](Register V) -> unsigned {
+    unsigned M = 0;
+    for (const auto &Seg : LIS.getInterval(V))
+      M = std::max(M, pressureAt(Seg.start));
+    return M;
+  };
+
+  // Coarse gate: peak GPR pressure (max simultaneously-live GPR vregs).  If it
+  // exceeds the bar, the whole function is register-bound; skip it (also saves
+  // solver time).  The per-candidate spill cost handles partially-pressured
+  // functions that pass this gate.
+  {
+    SmallVector<std::pair<SlotIndex, int>, 256> Ev;
+    for (Register R : GPRVRegs)
+      for (const auto &Seg : LIS.getInterval(R)) {
+        Ev.emplace_back(Seg.start, +1);
+        Ev.emplace_back(Seg.end, -1);
+      }
+    std::sort(Ev.begin(), Ev.end(),
+              [](const std::pair<SlotIndex, int> &A,
+                 const std::pair<SlotIndex, int> &B) {
+                if (A.first != B.first)
+                  return A.first < B.first;
+                return A.second > B.second; // +1 before -1 at the same slot
+              });
+    int Cur = 0, Peak = 0;
+    for (auto &E : Ev) {
+      Cur += E.second;
+      Peak = std::max(Peak, Cur);
+    }
+    if ((unsigned)Peak > RVCMaxPressure) {
+      LLVM_DEBUG(dbgs() << "RISCV-ASP-RVC: " << MF.getName() << " peak GPR "
+                        << "pressure " << Peak << " > " << RVCMaxPressure
+                        << "; skipping (register-bound)\n");
+      return false;
+    }
+  }
+
+  // ---- Interference + per-vreg contention (interference degree) -----------
+  const unsigned NumVRegs = IdToVReg.size();
+  std::vector<std::pair<unsigned, unsigned>> Interf;
+  std::vector<unsigned> Degree(NumVRegs, 0);
+  for (unsigned A = 0; A < NumVRegs; ++A)
+    for (unsigned B = A + 1; B < NumVRegs; ++B)
+      if (overlaps(IdToVReg[A], IdToVReg[B])) {
+        Interf.emplace_back(A, B);
+        ++Degree[A];
+        ++Degree[B];
+      }
+
+  // ---- Selective + pressure-aware gate ------------------------------------
+  // Only intervene where GPRC is actually contended: keep a candidate only if
+  // one of its required operands competes with at least RVCMinPressure other
+  // candidate operands (its interference degree).  In an uncontended region
+  // greedy already places the value in GPRC on its own, so a hint there is
+  // inframarginal -- it cannot add a compression, only perturb the allocator
+  // into spilling or rematerializing values (addresses) it would otherwise
+  // have kept in registers.  This both suppresses redundant hints and caps how
+  // much of the scarce GPRC pool the model may monopolize.
+  std::vector<bool> KeepCand(Cands.size(), false);
+  std::vector<bool> KeepVReg(NumVRegs, false);
+  unsigned NumKept = 0;
+  for (unsigned CI = 0; CI < Cands.size(); ++CI) {
+    bool Contended = false;
+    for (unsigned Id : Cands[CI].Needs)
+      if (Degree[Id] >= RVCMinPressure) {
+        Contended = true;
+        break;
+      }
+    if (!Contended)
+      continue;
+    KeepCand[CI] = true;
+    ++NumKept;
+    for (unsigned Id : Cands[CI].Needs)
+      KeepVReg[Id] = true;
+  }
+  if (NumKept == 0)
+    return false; // nothing contended; leave everything to greedy.
+
+  // ---- Emit candidate facts (kept candidates only) ------------------------
+  std::ostringstream Facts;
+  unsigned CandId = 0;
+  for (unsigned CI = 0; CI < Cands.size(); ++CI) {
+    if (!KeepCand[CI])
+      continue;
+    Facts << "cand(i" << CandId << "). cand_saving(i" << CandId << ", 2).";
+    for (unsigned Id : Cands[CI].Needs)
+      Facts << " needs_gprc(i" << CandId << ", " << Id << ").";
+    Facts << "\n";
+    if (Cands[CI].TieA >= 0)
+      Facts << "tied(" << Cands[CI].TieA << ", " << Cands[CI].TieB << ").\n";
+    ++CandId;
+  }
 
   // GPRC physical-register pool: index i -> GPRCRegs[i].  Mark the
   // callee-saved members (x8/x9 under the standard ABI) for the tie-breaker.
@@ -599,15 +805,33 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
         return (int)I;
     return -1;
   };
-  for (unsigned Id = 0, E = IdToVReg.size(); Id < E; ++Id) {
+  DenseSet<unsigned> PrecoloredIds;
+  for (unsigned Id = 0; Id < NumVRegs; ++Id) {
+    if (!KeepVReg[Id])
+      continue;
     auto It = AbiPhys.find(IdToVReg[Id]);
     if (It == AbiPhys.end())
       continue;
     int Pool = gprcPoolIndex(It->second);
-    if (Pool >= 0)
+    if (Pool >= 0) {
       Facts << "precolored(" << Id << ", " << Pool << ").\n";
-    else
+      PrecoloredIds.insert(Id);
+    } else
       Facts << "pinned_nongprc(" << Id << ").\n";
+  }
+
+  // Per-candidate spill cost: a vreg whose live range crosses a region where
+  // GPR pressure is at/above the threshold cannot be forced into the 8-register
+  // GPRC subset without evicting some value, so charge its placement the spill
+  // weight (in bytes) in the objective.  Precolored vregs already sit in their
+  // physical register, so binding them induces nothing -- skip those.
+  if (RVCSpillWeight > 0) {
+    for (unsigned Id = 0; Id < NumVRegs; ++Id) {
+      if (!KeepVReg[Id] || PrecoloredIds.count(Id))
+        continue;
+      if (maxPressureOver(IdToVReg[Id]) >= RVCSpillThreshold)
+        Facts << "cand_spill_cost(" << Id << ", " << RVCSpillWeight << ").\n";
+    }
   }
 
   // Spill-cost weights for callee-saved GPRC use, in bytes (same unit as
@@ -634,11 +858,69 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
   Facts << "cs_surcharge(" << CsSurcharge << ").\n";
   Facts << "cs_per_reg(" << CsPerReg << ").\n";
 
-  // Interference among candidate vregs (emit each pair once, V1 < V2).
-  for (unsigned A = 0, N = IdToVReg.size(); A < N; ++A)
-    for (unsigned B = A + 1; B < N; ++B)
-      if (LIS.getInterval(IdToVReg[A]).overlaps(LIS.getInterval(IdToVReg[B])))
-        Facts << "interfere(" << A << ", " << B << ").\n";
+  // Interference among kept candidate vregs (reuse the precomputed pairs).
+  for (auto [A, B] : Interf)
+    if (KeepVReg[A] && KeepVReg[B])
+      Facts << "interfere(" << A << ", " << B << ").\n";
+
+  // Vregs live across a call.  Binding such a vreg to a caller-saved GPRC reg
+  // (x10-x15, clobbered by the call) would force a spill/reload around it, so
+  // the model restricts them to callee-saved GPRC (x8/x9).  Conservatively mark
+  // a kept vreg as live-across if its value is still live at the register slot
+  // of any call.  Only relevant when binding (soft hints never force a spill).
+  if (RVCBindHints) {
+    SmallVector<SlotIndex, 8> CallSlots;
+    for (const MachineBasicBlock &MBB : MF)
+      for (const MachineInstr &MI : MBB)
+        if (MI.isCall())
+          CallSlots.push_back(LIS.getInstructionIndex(MI).getRegSlot());
+    for (unsigned Id = 0; Id < NumVRegs; ++Id) {
+      if (!KeepVReg[Id])
+        continue;
+      const LiveInterval &LI = LIS.getInterval(IdToVReg[Id]);
+      for (SlotIndex SI : CallSlots)
+        if (LI.liveAt(SI)) {
+          Facts << "live_across_call(" << Id << ").\n";
+          break;
+        }
+    }
+  }
+
+  // GPRC-occupancy headroom.  Cap how many candidates may sit in GPRC at any one
+  // program point, reserving (RVCHeadroom) of the eight registers for values the
+  // model cannot see.  Pressure peaks at live-range starts, so snapshot the set
+  // of kept candidates live at each candidate segment start and emit a per-point
+  // cap for the distinct sets larger than the cap.  RVCHeadroom == 0 (or >= pool
+  // size) disables this (interference already bounds occupancy at the pool size).
+  unsigned Cap = RVCHeadroom < GPRCRegs.size() ? GPRCRegs.size() - RVCHeadroom : 0;
+  if (RVCHeadroom > 0 && Cap < GPRCRegs.size()) {
+    Facts << "gprc_cap(" << Cap << ").\n";
+    SmallVector<unsigned, 64> Kept;
+    for (unsigned Id = 0; Id < NumVRegs; ++Id)
+      if (KeepVReg[Id])
+        Kept.push_back(Id);
+    SmallVector<SlotIndex, 128> Points;
+    for (unsigned Id : Kept)
+      for (const auto &Seg : LIS.getInterval(IdToVReg[Id]))
+        Points.push_back(Seg.start);
+    std::set<std::vector<unsigned>> Emitted;
+    unsigned PointId = 0;
+    for (SlotIndex SI : Points) {
+      std::vector<unsigned> S;
+      for (unsigned Id : Kept)
+        if (LIS.getInterval(IdToVReg[Id]).liveAt(SI))
+          S.push_back(Id);
+      if (S.size() <= Cap)
+        continue; // point not over capacity: no constraint needed.
+      if (!Emitted.insert(S).second)
+        continue; // identical live-set already constrained.
+      unsigned P = PointId++;
+      Facts << "point(" << P << ").";
+      for (unsigned Id : S)
+        Facts << " at(" << P << ", " << Id << ").";
+      Facts << "\n";
+    }
+  }
 
   std::string Program = std::string(kPhase1Prelude) + Facts.str();
   LLVM_DEBUG(dbgs() << "RISCV-ASP-RVC program for " << MF.getName() << ":\n"
@@ -652,22 +934,48 @@ bool RISCVRVCRegAllocHints::runOnMachineFunction(MachineFunction &MF) {
     return false;
   }
 
-  // Apply one hint per assigned vreg.  Tied vregs are given the same register
-  // by the solver, so coalescing falls out automatically.
-  DenseSet<unsigned> Hinted;
+  // Realize the assignment, one action per assigned vreg.  Tied vregs share a
+  // register in the model, so coalescing/co-binding falls out automatically.
+  //
+  // Binding constrains the vreg to the *GPRC class* (x8-x15), not to the single
+  // register the solver picked.  This still forces the value into the
+  // compressible register file -- guaranteeing the candidate compresses -- but
+  // leaves the allocator 8-way freedom to satisfy the many fixed-register uses
+  // the phase-1 model does not see (ABI arguments, return value, call setup,
+  // specific-register instructions).  A single-register constraint instead
+  // collides with those fixed uses and makes the allocator run out of
+  // registers; binding to the class is crash-safe (worst case it spills).  We
+  // still emit the solver's specific register as a soft hint so the allocator
+  // prefers the globally-chosen packing within GPRC.
+  bool Changed = false;
+  DenseSet<unsigned> Applied;
   for (auto [VIdx, RIdx] : Assignment) {
     if (VIdx >= IdToVReg.size() || RIdx >= GPRCRegs.size())
       continue;
-    if (!Hinted.insert(VIdx).second)
+    // ABI-pinned vregs already sit in their physical register; touching them is
+    // redundant and only adds noise.
+    if (PrecoloredIds.count(VIdx))
+      continue;
+    if (!Applied.insert(VIdx).second)
       continue;
     Register VReg = IdToVReg[VIdx];
     MCPhysReg PhysReg = GPRCRegs[RIdx];
+
+    if (RVCBindHints && MRI.constrainRegClass(VReg, &RISCV::GPRCRegClass)) {
+      MRI.addRegAllocationHint(VReg, PhysReg); // prefer the packed register
+      ++NumGPRCHints;
+      Changed = true;
+      LLVM_DEBUG(dbgs() << "RISCV-ASP-RVC: bind " << printReg(VReg)
+                        << " -> GPRC (hint " << printReg(PhysReg, ST.getRegisterInfo())
+                        << ")\n");
+      continue;
+    }
     MRI.addRegAllocationHint(VReg, PhysReg);
     ++NumGPRCHints;
     LLVM_DEBUG(dbgs() << "RISCV-ASP-RVC: hint " << printReg(VReg) << " -> "
                       << printReg(PhysReg, ST.getRegisterInfo()) << "\n");
   }
-  return false; // hints only; nothing in the function changed.
+  return Changed;
 #else
   static bool Warned = false;
   if (!Warned) {

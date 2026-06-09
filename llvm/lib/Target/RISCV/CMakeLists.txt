@@ -62,6 +62,7 @@ add_llvm_target(RISCVCodeGen
   RISCVRedundantCopyElimination.cpp
   RISCVRegisterInfo.cpp
   RISCVRVCRegAllocHints.cpp
+  RISCVASPRegAlloc.cpp
   RISCVSelectionDAGInfo.cpp
   RISCVSubtarget.cpp
   RISCVTargetMachine.cpp
@@ -103,6 +104,12 @@ add_llvm_target(RISCVCodeGen
   ADD_TO_COMPONENT
   RISCV
   )
+
+# The single-phase ASP allocator (RISCVASPRegAlloc.cpp) reuses the CodeGen
+# register-allocation driver headers (RegAllocBase.h, AllocationOrder.h), which
+# live in lib/CodeGen rather than the public include tree.
+target_include_directories(LLVMRISCVCodeGen PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../CodeGen)
 
 # Link Clingo into LLVMRISCVCodeGen when the clingo subproject is enabled, so
 # the phase-1 ASP GPRC allocator (RISCVRVCRegAllocHints.cpp) can call libclingo

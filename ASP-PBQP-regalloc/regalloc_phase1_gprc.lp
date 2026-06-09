@@ -59,6 +59,18 @@ in_gprc(V, R) :- precolored(V, R), gprc_reg(R).
 % both are placed in the same GPRC reg or neither is placed.
 :- tied_sym(V1, V2), in_gprc(V1, R), not in_gprc(V2, R).
 
+% A vreg live across a call cannot occupy a caller-saved GPRC register
+% (x10-x15 are clobbered at the call); only callee-saved GPRC (x8/x9) survives.
+% Without this, binding such a placement would force a spill/reload around the
+% call.  live_across_call/1 is supplied for the relevant vregs.
+:- in_gprc(V, R), live_across_call(V), gprc_reg(R), not gprc_callee_saved(R).
+
+% GPRC-occupancy headroom: at each high-pressure program point P, allow at most
+% gprc_cap(K) candidates in GPRC, leaving the rest of x8-x15 for values not
+% modelled here (addresses, non-candidates).  point/1 and at/2 give the
+% candidate vregs live at P; the pass emits them only for points over capacity.
+:- point(P), gprc_cap(K), C = #count { V : in_gprc(V), at(P, V) }, C > K.
+
 % ---- Realization of compression -------------------------------------------
 blocked(I)  :- needs_gprc(I, V), not in_gprc(V).
 realized(I) :- cand(I), not blocked(I).
@@ -91,6 +103,12 @@ any_callee_saved     :- used_callee_saved(_).
 #maximize { B@2, realized, I : realized(I), cand_saving(I, B) }.
 #minimize { S@2, surcharge : any_callee_saved, cs_surcharge(S) }.
 #minimize { C@2, perreg, R : used_callee_saved(R), cs_per_reg(C) }.
+% Per-candidate spill cost: placing a vreg in GPRC inside a register-saturated
+% region forces a spill of some value.  cand_spill_cost(V, S) gives that cost in
+% bytes (supplied by the pass for vregs whose live range crosses a high-pressure
+% region), netted against the compression so a placement happens only when the
+% bytes it saves exceed the spill bytes it induces.
+#minimize { S@2, spill, V : in_gprc(V), cand_spill_cost(V, S) }.
 
 % ---- Optional pressure guardrail (disabled by default) --------------------
 % Pinning a vreg into GPRC removes one register from the GPR pool greedy sees,

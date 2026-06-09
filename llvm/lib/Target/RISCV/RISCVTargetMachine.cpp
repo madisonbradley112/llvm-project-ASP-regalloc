@@ -116,6 +116,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeKCFIPass(*PR);
   initializeRISCVDeadRegisterDefinitionsPass(*PR);
   initializeRISCVRVCRegAllocHintsPass(*PR);
+  initializeRISCVASPRegAllocPass(*PR);
   initializeRISCVLateBranchOptPass(*PR);
   initializeRISCVMakeCompressibleOptPass(*PR);
   initializeRISCVGatherScatterLoweringPass(*PR);
