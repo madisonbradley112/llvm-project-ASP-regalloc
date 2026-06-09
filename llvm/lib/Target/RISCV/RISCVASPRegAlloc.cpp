@@ -6,55 +6,52 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// A single-phase, code-size-oriented register allocator for RISC-V.  Unlike the
-// phase-1 hint pass (RISCVRVCRegAllocHints), which only nudges the greedy
-// allocator, this *is* the allocator: it performs one whole-function Answer Set
-// Programming solve that jointly chooses register assignments while maximizing
-// RVC (compressed) instructions, then realizes that assignment using LLVM's
-// standard allocation machinery (VirtRegMap / LiveRegMatrix / InlineSpiller),
-// spilling whatever does not fit -- exactly as the basic allocator does.
+// A single-phase, code-size-oriented register allocator for RISC-V, built on
+// top of the greedy allocator.  It runs one whole-function Answer Set
+// Programming solve that colors the GPR interference graph to maximize RVC
+// (compressed) instructions and eliminated copies, then *binds* that coloring
+// by pre-assigning each chosen vreg into LiveRegMatrix before greedy's main
+// loop.  Greedy then performs all live-range splitting, eviction and spilling
+// for everything the solver did not place -- and, on functions the solver
+// cannot color combinatorially (too large, or the solve times out), it simply
+// runs as plain greedy.  So the fallback is the state-of-the-art allocator, not
+// a basic one.
 //
-// It is built on RegAllocBase (like RABasic) so the proven spill/rewrite path
-// is reused unchanged.  The ASP solution is consulted as a *binding preference*
-// in selectOrSplit: a virtual register is placed in its solver-chosen physical
-// register whenever that register is interference-free; otherwise the allocator
-// falls back to the basic select-or-spill logic, guaranteeing correctness and
-// forward progress regardless of what the solver returned (or if it timed out,
-// or if LLVM was built without Clingo).
+// Binding via pre-assignment (not register-allocation hints) is deliberate: a
+// soft hint is a lossy channel that greedy discards under pressure, whereas a
+// pre-assignment is realized exactly where it is interference-free.
 //
-// Selected with -regalloc=riscv-asp-cs.  The default greedy allocator and the
-// phase-1 hint pass are unaffected and remain the alternates.
+// Selected with -regalloc=riscv-asp-cs.  Default greedy and the phase-1 hint
+// pass are unaffected and remain the alternates.
 //
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
 #include "RISCVInstrInfo.h"
 #include "RISCVSubtarget.h"
-#include "RegAllocBase.h"
+#include "RegAllocGreedy.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/CodeGen/CalcSpillWeights.h"
+#include "llvm/CodeGen/EdgeBundles.h"
 #include "llvm/CodeGen/LiveDebugVariables.h"
 #include "llvm/CodeGen/LiveIntervals.h"
-#include "llvm/CodeGen/LiveRangeEdit.h"
 #include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/LiveStacks.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
-#include "llvm/CodeGen/Spiller.h"
-#include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
-#include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/CodeGen/SpillPlacement.h"
+#include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
-#include <queue>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -72,88 +69,120 @@ using namespace llvm;
 
 #define DEBUG_TYPE "riscv-asp-cs"
 
-STATISTIC(NumASPAssigned, "Vregs placed in their ASP-chosen register");
-STATISTIC(NumASPFallback, "Vregs that fell back to basic allocation");
+STATISTIC(NumASPAssigned, "Vregs bound to their ASP-chosen register");
 
 static cl::opt<unsigned>
     ASPCSTimeLimit("riscv-asp-cs-time-limit", cl::Hidden, cl::init(10),
-                   cl::desc("Clingo time limit (s) for the single-phase solve"));
+                   cl::desc("Clingo wall-clock time limit (seconds) for the "
+                            "single-phase solve; raise/lower to trade solve "
+                            "time against allocation quality"));
 
 // Combinatorial coloring does not scale to very large functions; above this
-// many GPR virtual registers, skip the solve and allocate basically.
+// many GPR virtual registers, skip the solve and let greedy allocate.
 static cl::opt<unsigned>
     ASPCSMaxVRegs("riscv-asp-cs-max-vregs", cl::Hidden, cl::init(80),
                   cl::desc("Skip the ASP solve above this many GPR vregs"));
 
 namespace {
 
-struct CompSpillWeight {
-  bool operator()(const LiveInterval *A, const LiveInterval *B) const {
-    return A->weight() < B->weight();
-  }
-};
-
-class RISCVASPRegAlloc : public MachineFunctionPass,
-                         public RegAllocBase,
-                         private LiveRangeEdit::Delegate {
-  MachineFunction *MF = nullptr;
-  std::unique_ptr<Spiller> SpillerInstance;
-  std::priority_queue<const LiveInterval *, std::vector<const LiveInterval *>,
-                      CompSpillWeight>
-      Queue;
-
-  /// Solver-chosen physical register for each original virtual register.
+//===----------------------------------------------------------------------===//
+// The allocator: greedy, plus an ASP pre-seeding step in enqueueImpl.
+//===----------------------------------------------------------------------===//
+class RISCVASPGreedy : public RAGreedy {
+  bool Solved = false;
   DenseMap<Register, MCRegister> ASPChoice;
 
-  bool LRE_CanEraseVirtReg(Register) override;
-  void LRE_WillShrinkVirtReg(Register) override;
-
-  // Build and solve the single-phase ASP model; fill ASPChoice.  A no-op (no
-  // preferences) when built without Clingo or when the solve yields nothing.
+  // Build and solve the single-phase model from the function; fill ASPChoice.
   void solveASP();
 
 public:
-  static char ID;
+  RISCVASPGreedy(RAGreedy::RequiredAnalyses &A,
+                 const RegAllocFilterFunc F = nullptr)
+      : RAGreedy(A, F) {}
 
+  // Trigger the solve once, on the first enqueue (after init(), so liveness and
+  // the matrix are ready), then enqueue normally so greedy initializes its
+  // per-vreg bookkeeping (eviction stages etc.) for every vreg.
+  void enqueueImpl(const LiveInterval *LI) override {
+    if (!Solved) {
+      solveASP();
+      Solved = true;
+    }
+    RAGreedy::enqueueImpl(LI);
+  }
+
+  // Bind the solver's choice when it is class-legal and interference-free;
+  // otherwise fall back to the full greedy selector (eviction / splitting /
+  // spilling).  Binding here (a committed assignment) rather than via a soft
+  // hint is deliberate: hints are discarded under pressure, an assignment is
+  // not.  Functions the solver did not color produce no choices -> pure greedy.
+  MCRegister selectOrSplit(const LiveInterval &VirtReg,
+                           SmallVectorImpl<Register> &NewVRegs) override {
+    auto It = ASPChoice.find(VirtReg.reg());
+    if (It != ASPChoice.end()) {
+      MCRegister P = It->second;
+      if (MRI->getRegClass(VirtReg.reg())->contains(P) &&
+          Matrix->checkInterference(VirtReg, P) == LiveRegMatrix::IK_Free) {
+        ++NumASPAssigned;
+        return P;
+      }
+    }
+    return RAGreedy::selectOrSplit(VirtReg, NewVRegs);
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Legacy pass wrapper: gathers analyses and drives RISCVASPGreedy (mirrors
+// RAGreedyLegacy so the -regalloc registry can select it).
+//===----------------------------------------------------------------------===//
+class RISCVASPRegAlloc : public MachineFunctionPass {
+public:
+  static char ID;
   RISCVASPRegAlloc() : MachineFunctionPass(ID) {}
 
   StringRef getPassName() const override {
     return "RISC-V single-phase ASP register allocator";
   }
 
-  void getAnalysisUsage(AnalysisUsage &AU) const override;
-  void releaseMemory() override { SpillerInstance.reset(); }
-
-  Spiller &spiller() override { return *SpillerInstance; }
-  // Skip vregs already placed by the ASP pre-seeding step, so the global
-  // coloring is realized exactly instead of being re-derived per vreg.
-  void enqueueImpl(const LiveInterval *LI) override {
-    if (!VRM->hasPhys(LI->reg()))
-      Queue.push(LI);
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
+    AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
+    AU.addRequired<LiveIntervalsWrapperPass>();
+    AU.addPreserved<LiveIntervalsWrapperPass>();
+    AU.addRequired<SlotIndexesWrapperPass>();
+    AU.addPreserved<SlotIndexesWrapperPass>();
+    AU.addRequired<LiveDebugVariablesWrapperLegacy>();
+    AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
+    AU.addRequired<LiveStacksWrapperLegacy>();
+    AU.addPreserved<LiveStacksWrapperLegacy>();
+    AU.addRequired<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineDominatorTreeWrapperPass>();
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
+    AU.addRequired<VirtRegMapWrapperLegacy>();
+    AU.addPreserved<VirtRegMapWrapperLegacy>();
+    AU.addRequired<LiveRegMatrixWrapperLegacy>();
+    AU.addPreserved<LiveRegMatrixWrapperLegacy>();
+    AU.addRequired<EdgeBundlesWrapperLegacy>();
+    AU.addRequired<SpillPlacementWrapperLegacy>();
+    AU.addRequired<MachineOptimizationRemarkEmitterPass>();
+    AU.addRequired<RegAllocEvictionAdvisorAnalysisLegacy>();
+    AU.addRequired<RegAllocPriorityAdvisorAnalysisLegacy>();
+    MachineFunctionPass::getAnalysisUsage(AU);
   }
-  const LiveInterval *dequeue() override {
-    if (Queue.empty())
-      return nullptr;
-    const LiveInterval *LI = Queue.top();
-    Queue.pop();
-    return LI;
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    RAGreedy::RequiredAnalyses Analyses(*this);
+    RISCVASPGreedy Impl(Analyses);
+    return Impl.run(MF);
   }
-
-  MCRegister selectOrSplit(const LiveInterval &VirtReg,
-                           SmallVectorImpl<Register> &SplitVRegs) override;
-
-  bool runOnMachineFunction(MachineFunction &mf) override;
-
-  bool spillInterferences(const LiveInterval &VirtReg, MCRegister PhysReg,
-                          SmallVectorImpl<Register> &SplitVRegs);
 
   MachineFunctionProperties getRequiredProperties() const override {
-    return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::NoPHIs);
+    return MachineFunctionProperties().setNoPHIs();
   }
   MachineFunctionProperties getClearedProperties() const override {
-    return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::IsSSA);
+    return MachineFunctionProperties().setIsSSA();
   }
 };
 
@@ -169,12 +198,15 @@ INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(RegisterCoalescerLegacy)
 INITIALIZE_PASS_DEPENDENCY(MachineSchedulerLegacy)
 INITIALIZE_PASS_DEPENDENCY(LiveStacksWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_DEPENDENCY(LiveRegMatrixWrapperLegacy)
-INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(EdgeBundlesWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(SpillPlacementWrapperLegacy)
+INITIALIZE_PASS_DEPENDENCY(MachineOptimizationRemarkEmitterPass)
+INITIALIZE_PASS_DEPENDENCY(RegAllocEvictionAdvisorAnalysisLegacy)
+INITIALIZE_PASS_DEPENDENCY(RegAllocPriorityAdvisorAnalysisLegacy)
 INITIALIZE_PASS_END(RISCVASPRegAlloc, "riscv-asp-cs",
                     "RISC-V single-phase ASP register allocator", false, false)
 
@@ -183,192 +215,26 @@ static RegisterRegAlloc
                   "RISC-V single-phase ASP (code-size) register allocator",
                   []() -> FunctionPass * { return new RISCVASPRegAlloc(); });
 
-void RISCVASPRegAlloc::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesCFG();
-  AU.addRequired<AAResultsWrapperPass>();
-  AU.addPreserved<AAResultsWrapperPass>();
-  AU.addRequired<LiveIntervalsWrapperPass>();
-  AU.addPreserved<LiveIntervalsWrapperPass>();
-  AU.addPreserved<SlotIndexesWrapperPass>();
-  AU.addRequired<LiveDebugVariablesWrapperLegacy>();
-  AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
-  AU.addRequired<LiveStacksWrapperLegacy>();
-  AU.addPreserved<LiveStacksWrapperLegacy>();
-  AU.addRequired<ProfileSummaryInfoWrapperPass>();
-  AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
-  AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
-  AU.addRequired<MachineDominatorTreeWrapperPass>();
-  AU.addRequiredID(MachineDominatorsID);
-  AU.addPreservedID(MachineDominatorsID);
-  AU.addRequired<MachineLoopInfoWrapperPass>();
-  AU.addPreserved<MachineLoopInfoWrapperPass>();
-  AU.addRequired<VirtRegMapWrapperLegacy>();
-  AU.addPreserved<VirtRegMapWrapperLegacy>();
-  AU.addRequired<LiveRegMatrixWrapperLegacy>();
-  AU.addPreserved<LiveRegMatrixWrapperLegacy>();
-  MachineFunctionPass::getAnalysisUsage(AU);
-}
-
-bool RISCVASPRegAlloc::LRE_CanEraseVirtReg(Register VirtReg) {
-  LiveInterval &LI = LIS->getInterval(VirtReg);
-  if (VRM->hasPhys(VirtReg)) {
-    Matrix->unassign(LI);
-    aboutToRemoveInterval(LI);
-    return true;
-  }
-  LI.clear();
-  return false;
-}
-
-void RISCVASPRegAlloc::LRE_WillShrinkVirtReg(Register VirtReg) {
-  if (!VRM->hasPhys(VirtReg))
-    return;
-  LiveInterval &LI = LIS->getInterval(VirtReg);
-  Matrix->unassign(LI);
-  enqueue(&LI);
-}
-
-// Identical to RABasic::spillInterferences.
-bool RISCVASPRegAlloc::spillInterferences(
-    const LiveInterval &VirtReg, MCRegister PhysReg,
-    SmallVectorImpl<Register> &SplitVRegs) {
-  SmallVector<const LiveInterval *, 8> Intfs;
-  for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
-    LiveIntervalUnion::Query &Q = Matrix->query(VirtReg, Unit);
-    for (const auto *Intf : reverse(Q.interferingVRegs())) {
-      if (!Intf->isSpillable() || Intf->weight() > VirtReg.weight())
-        return false;
-      Intfs.push_back(Intf);
-    }
-  }
-  for (const LiveInterval *Spill : Intfs) {
-    if (!VRM->hasPhys(Spill->reg()))
-      continue;
-    Matrix->unassign(*Spill);
-    LiveRangeEdit LRE(Spill, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
-    spiller().spill(LRE);
-  }
-  return true;
-}
-
-MCRegister
-RISCVASPRegAlloc::selectOrSplit(const LiveInterval &VirtReg,
-                                SmallVectorImpl<Register> &SplitVRegs) {
-  // 1) Binding preference: if the solver chose a register for this vreg and it
-  //    is interference-free right now, use it.
-  auto It = ASPChoice.find(VirtReg.reg());
-  if (It != ASPChoice.end()) {
-    MCRegister Pref = It->second;
-    // Only honor the solver's choice if it is legal for this vreg's register
-    // class and currently interference-free; otherwise fall back.
-    if (MRI->getRegClass(VirtReg.reg())->contains(Pref) &&
-        Matrix->checkInterference(VirtReg, Pref) == LiveRegMatrix::IK_Free) {
-      ++NumASPAssigned;
-      return Pref;
-    }
-  }
-
-  // 2) Basic select-or-split fallback.  Iterate the class allocation order
-  //    directly (AllocationOrder is a CodeGen-internal symbol not exported to
-  //    target libraries; RegClassInfo::getOrder gives the same register order).
-  ++NumASPFallback;
-  SmallVector<MCRegister, 8> PhysRegSpillCands;
-  ArrayRef<MCPhysReg> Order =
-      RegClassInfo.getOrder(MRI->getRegClass(VirtReg.reg()));
-  for (MCRegister PhysReg : Order) {
-    switch (Matrix->checkInterference(VirtReg, PhysReg)) {
-    case LiveRegMatrix::IK_Free:
-      return PhysReg;
-    case LiveRegMatrix::IK_VirtReg:
-      PhysRegSpillCands.push_back(PhysReg);
-      continue;
-    default:
-      continue;
-    }
-  }
-  for (MCRegister &PhysReg : PhysRegSpillCands) {
-    if (!spillInterferences(VirtReg, PhysReg, SplitVRegs))
-      continue;
-    return PhysReg;
-  }
-  if (!VirtReg.isSpillable())
-    return ~0u;
-  LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM, this, &DeadRemats);
-  spiller().spill(LRE);
-  return 0;
-}
-
-bool RISCVASPRegAlloc::runOnMachineFunction(MachineFunction &mf) {
-  LLVM_DEBUG(dbgs() << "********** RISC-V ASP REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << mf.getName() << '\n');
-  MF = &mf;
-  auto &MBFI = getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
-  auto &LiveStks = getAnalysis<LiveStacksWrapperLegacy>().getLS();
-  auto &MDT = getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-
-  RegAllocBase::init(getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
-                     getAnalysis<LiveIntervalsWrapperPass>().getLIS(),
-                     getAnalysis<LiveRegMatrixWrapperLegacy>().getLRM());
-  VirtRegAuxInfo VRAI(*MF, *LIS, *VRM,
-                      getAnalysis<MachineLoopInfoWrapperPass>().getLI(), MBFI,
-                      &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI());
-  VRAI.calculateSpillWeightsAndHints();
-
-  SpillerInstance.reset(
-      createInlineSpiller({*LIS, LiveStks, MDT, MBFI}, *MF, *VRM, VRAI));
-
-  ASPChoice.clear();
-  solveASP();
-
-  // Pre-seed the solver's coloring directly into the matrix, so the global
-  // assignment is realized exactly rather than re-derived one vreg at a time
-  // (which lets earlier vregs steal registers a later vreg's choice wanted,
-  // forcing shuffle moves).  Only place a choice that is legal for the vreg's
-  // class and currently interference-free; the rest go through allocatePhysRegs.
-  for (auto &[VReg, PhysReg] : ASPChoice) {
-    if (!MRI->reg_nodbg_empty(VReg) && !VRM->hasPhys(VReg) &&
-        MRI->getRegClass(VReg)->contains(PhysReg)) {
-      LiveInterval &LI = LIS->getInterval(VReg);
-      if (Matrix->checkInterference(LI, PhysReg) == LiveRegMatrix::IK_Free) {
-        Matrix->assign(LI, PhysReg);
-        ++NumASPAssigned;
-      }
-    }
-  }
-
-  allocatePhysRegs();
-  postOptimization();
-  releaseMemory();
-  return true;
-}
+FunctionPass *llvm::createRISCVASPRegAlloc() { return new RISCVASPRegAlloc(); }
 
 //===----------------------------------------------------------------------===//
-// The single-phase ASP solve.  Builds the model from the function and fills
-// ASPChoice with a solver-chosen physical register per original vreg.
+// The single-phase ASP solve.
 //===----------------------------------------------------------------------===//
 
 #ifdef LLVM_PBQP_HAVE_CLINGO
 
-// Static policy half of the single-phase model.  Dynamic facts (reg/1, gprc/1,
-// vreg/1, interfere/2, cand/1, cand_save/2, needs_gprc/2) are appended per
-// function.  The allocator owns spilling, so the model only colors the
-// interference graph to maximize realized compressions.
+// Static policy half of the model.  Dynamic facts are appended per function.
+// Greedy owns spilling, so the model colors the interference graph to maximize
+// realized compressions and eliminated copies, minus callee-saved cost.
 static const char *const kASPModel =
     "{ assign(V, R) : reg(R) } 1 :- vreg(V).\n"
     ":- assign(V1, R), assign(V2, R), interfere(V1, V2).\n"
     "gprc_ok(V) :- assign(V, R), gprc(R).\n"
     "blocked(I) :- needs_gprc(I, V), not gprc_ok(V).\n"
     "realized(I) :- cand(I), not blocked(I).\n"
-    "% A copy is eliminated when its two ends land in the same register: a vreg\n"
-    "% pinned to the physical register it is copied to/from (ABI args/returns),\n"
-    "% or two copy-related vregs sharing a register.  Each saves its bytes.\n"
     "coalesced(C) :- copy_phys(C, V, R), assign(V, R).\n"
     "coalesced(C) :- copy_v(C, V1, V2), assign(V1, R), assign(V2, R).\n"
-    "% Using a callee-saved register forces a prologue save/restore: charge\n"
-    "% cs_cost bytes per distinct callee-saved register touched.\n"
     "used_cs(R) :- assign(_, R), callee_saved(R).\n"
-    "% Objective (bytes): realized compressions plus eliminated copies, minus\n"
-    "% the save/restore cost of any callee-saved registers used.\n"
     "#maximize { B@1, realized, I : realized(I), cand_save(I, B) }.\n"
     "#maximize { B@1, coalesced, C : coalesced(C), copy_save(C, B) }.\n"
     "#minimize { N@1, cs, R : used_cs(R), cs_cost(N) }.\n"
@@ -392,7 +258,6 @@ static bool parseAssignAtom(clingo_symbol_t Sym, unsigned &V, unsigned &R) {
   return true;
 }
 
-// Solve kASPModel + Facts, keeping the optimal model's assign/2 atoms.
 static bool runASPSolve(const std::string &Program, unsigned TimeLimitSecs,
                         std::vector<std::pair<unsigned, unsigned>> &Out) {
   clingo_control_t *Ctl = nullptr;
@@ -462,12 +327,12 @@ static bool runASPSolve(const std::string &Program, unsigned TimeLimitSecs,
   return true;
 }
 
-void RISCVASPRegAlloc::solveASP() {
-  const RISCVSubtarget &ST = MF->getSubtarget<RISCVSubtarget>();
+void RISCVASPGreedy::solveASP() {
+  MachineFunction &MF = VRM->getMachineFunction();
+  const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
   if (!ST.hasStdExtZca())
     return; // no compressed instruction forms available.
 
-  // GPR allocation pool (dense id -> physreg), with GPRC members marked.
   ArrayRef<MCPhysReg> Pool = RegClassInfo.getOrder(&RISCV::GPRRegClass);
   if (Pool.empty())
     return;
@@ -475,7 +340,6 @@ void RISCVASPRegAlloc::solveASP() {
   for (unsigned I = 0; I < Pool.size(); ++I)
     RegId[Pool[I]] = I;
 
-  // GPR virtual registers to color (dense id).
   DenseMap<Register, unsigned> VRegId;
   std::vector<Register> IdToVReg;
   auto getVId = [&](Register R) -> int {
@@ -491,10 +355,6 @@ void RISCVASPRegAlloc::solveASP() {
     return (int)Id;
   };
 
-  // Classify a compressible instruction: returns true and fills NeedVRegs with
-  // the virtual operands that must be in GPRC, or false if not a (realizable)
-  // candidate.  A fixed non-GPRC physreg operand rejects the candidate; a fixed
-  // GPRC physreg operand is already satisfied and simply omitted.
   auto immOk = [](const MachineInstr &MI, unsigned OpNo, auto Pred) -> bool {
     return MI.getOperand(OpNo).isImm() &&
            Pred((int64_t)MI.getOperand(OpNo).getImm());
@@ -509,7 +369,7 @@ void RISCVASPRegAlloc::solveASP() {
     if (R.isPhysical()) {
       if (!RISCV::GPRCRegClass.contains(R))
         Reject = true;
-      return; // fixed GPRC physreg: already satisfied.
+      return;
     }
     Need.push_back(R);
   };
@@ -533,7 +393,6 @@ void RISCVASPRegAlloc::solveASP() {
     case RISCV::LD:
     case RISCV::SD:
       return isLoadStore([](int64_t I) { return isShiftedUInt<5, 3>(I); }, false);
-    // Reg-reg two-address ALU: compresses only in the coalesced rd==rs1 form.
     case RISCV::AND:
     case RISCV::OR:
     case RISCV::XOR:
@@ -542,12 +401,11 @@ void RISCVASPRegAlloc::solveASP() {
     case RISCV::SUBW: {
       if (!MI.getOperand(0).isReg() || !MI.getOperand(1).isReg() ||
           MI.getOperand(0).getReg() != MI.getOperand(1).getReg())
-        return false; // not coalesced two-address -> cannot compress.
+        return false;
       opOK(MI.getOperand(0), Need, Reject);
       opOK(MI.getOperand(2), Need, Reject);
       return !Reject && !Need.empty();
     }
-    // Reg-imm two-address.
     case RISCV::ANDI:
       if (!immOk(MI, 2, [](int64_t I) { return isInt<6>(I); }))
         return false;
@@ -568,10 +426,9 @@ void RISCVASPRegAlloc::solveASP() {
     }
   };
 
-  // ---- Build facts ---------------------------------------------------------
   std::ostringstream F;
   std::vector<std::pair<const MachineInstr *, SmallVector<Register, 3>>> Cands;
-  for (const MachineBasicBlock &MBB : *MF)
+  for (const MachineBasicBlock &MBB : MF)
     for (const MachineInstr &MI : MBB) {
       SmallVector<Register, 3> Need;
       if (!classify(MI, Need))
@@ -586,12 +443,8 @@ void RISCVASPRegAlloc::solveASP() {
         Cands.emplace_back(&MI, std::move(Need));
     }
 
-  // Copies: a vreg copied to/from an allocatable physreg (ABI args/returns) or
-  // another vreg can be elided if both ends share a register.  Model them so
-  // the solver co-locates them (coalescing), traded against compression.  Copy
-  // operands are added to the vreg set even if they are not candidates.
   std::vector<std::tuple<bool, unsigned, unsigned>> Copies; // (phys, A, B)
-  for (const MachineBasicBlock &MBB : *MF)
+  for (const MachineBasicBlock &MBB : MF)
     for (const MachineInstr &MI : MBB) {
       if (!MI.isCopy())
         continue;
@@ -615,9 +468,8 @@ void RISCVASPRegAlloc::solveASP() {
     }
 
   if (IdToVReg.empty() || IdToVReg.size() > ASPCSMaxVRegs)
-    return; // nothing to do, or too large to color combinatorially.
+    return;
 
-  // Callee-saved membership for the pool registers.
   const MCPhysReg *CSR = MRI->getCalleeSavedRegs();
   auto isCalleeSaved = [&](MCPhysReg R) {
     for (const MCPhysReg *P = CSR; P && *P; ++P)
@@ -633,9 +485,6 @@ void RISCVASPRegAlloc::solveASP() {
       F << " callee_saved(" << I << ").";
     F << "\n";
   }
-  // Per-callee-saved-register cost (bytes), feature-aware: a save/restore pair
-  // is cheap when amortized by Zcmp cm.push/pop or the save-restore millicode,
-  // but a real c.sdsp/c.ldsp pair (plus frame setup) under an inline frame.
   unsigned CsCost = (ST.hasStdExtZcmp() || ST.enableSaveRestore()) ? 1 : 4;
   F << "cs_cost(" << CsCost << ").\n";
   for (unsigned I = 0; I < IdToVReg.size(); ++I)
@@ -660,24 +509,22 @@ void RISCVASPRegAlloc::solveASP() {
   }
 
   std::string Program = std::string(kASPModel) + F.str();
-  LLVM_DEBUG(dbgs() << "RISCV-ASP-CS program for " << MF->getName() << ":\n"
+  LLVM_DEBUG(dbgs() << "RISCV-ASP-CS program for " << MF.getName() << ":\n"
                     << Program << "\n");
 
   std::vector<std::pair<unsigned, unsigned>> Assignment;
   if (!runASPSolve(Program, ASPCSTimeLimit, Assignment))
-    return; // UNSAT / timeout / no model: basic allocation.
+    return;
 
   for (auto [VIdx, RIdx] : Assignment)
     if (VIdx < IdToVReg.size() && RIdx < Pool.size())
       ASPChoice[IdToVReg[VIdx]] = Pool[RIdx];
-  LLVM_DEBUG(dbgs() << "RISCV-ASP-CS: " << ASPChoice.size() << " preferences for "
-                    << MF->getName() << "\n");
+  LLVM_DEBUG(dbgs() << "RISCV-ASP-CS: " << ASPChoice.size() << " bindings for "
+                    << MF.getName() << "\n");
 }
 
 #else
 
-void RISCVASPRegAlloc::solveASP() {}
+void RISCVASPGreedy::solveASP() {}
 
 #endif // LLVM_PBQP_HAVE_CLINGO
-
-FunctionPass *llvm::createRISCVASPRegAlloc() { return new RISCVASPRegAlloc(); }

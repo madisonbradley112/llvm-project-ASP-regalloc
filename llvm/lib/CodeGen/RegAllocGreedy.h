@@ -57,10 +57,39 @@ class SlotIndexes;
 class TargetInstrInfo;
 class VirtRegMap;
 
-class LLVM_LIBRARY_VISIBILITY RAGreedy : public RegAllocBase,
-                                         private LiveRangeEdit::Delegate {
+class Pass;
+
+// Default (exported) visibility rather than LLVM_LIBRARY_VISIBILITY: the
+// RISC-V single-phase ASP allocator subclasses RAGreedy from another library,
+// which requires its symbols and vtable to cross the shared-library boundary.
+class RAGreedy : public RegAllocBase, private LiveRangeEdit::Delegate {
 public:
-  struct RequiredAnalyses;
+  /// The analyses RAGreedy needs, gathered either from a legacy Pass or from
+  /// the new-pass-manager analysis manager.  Defined here (rather than in the
+  /// .cpp) so out-of-file allocators can construct and subclass RAGreedy.
+  struct RequiredAnalyses {
+    VirtRegMap *VRM = nullptr;
+    LiveIntervals *LIS = nullptr;
+    LiveRegMatrix *LRM = nullptr;
+    SlotIndexes *Indexes = nullptr;
+    MachineBlockFrequencyInfo *MBFI = nullptr;
+    MachineDominatorTree *DomTree = nullptr;
+    MachineLoopInfo *Loops = nullptr;
+    MachineOptimizationRemarkEmitter *ORE = nullptr;
+    EdgeBundles *Bundles = nullptr;
+    SpillPlacement *SpillPlacer = nullptr;
+    LiveDebugVariables *DebugVars = nullptr;
+
+    // Used by InlineSpiller
+    LiveStacks *LSS;
+    // Proxies for eviction and priority advisors
+    RegAllocEvictionAdvisorProvider *EvictProvider;
+    RegAllocPriorityAdvisorProvider *PriorityProvider;
+
+    RequiredAnalyses() = delete;
+    RequiredAnalyses(Pass &P);
+    RequiredAnalyses(MachineFunction &MF, MachineFunctionAnalysisManager &MFAM);
+  };
 
   // Interface to eviction advisers
   /// Track allocation stage and eviction loop prevention during allocation.
