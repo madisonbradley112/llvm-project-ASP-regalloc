@@ -72,9 +72,39 @@ Every region is provably optimal, and adaptive **beats the best fixed window**
 on the two larger instances with *no tuning*. The width histograms show the
 intended behaviour: a wide 40-window over the easy prologue, settling to ~10–19
 through the dense body. The probe limit is a clean speed/quality dial — a 2 s
-probe reaches i80 −56 but takes 11 s; 1 s gives −52 in 4 s. (Remaining
-inefficiency: ~half the regions still spend one wasted probe before narrowing;
-a binary search for the max-optimal width would cut that further.)
+probe reaches i80 −56 but takes 11 s; 1 s gives −52 in 4 s.
+
+### Binary search + re-widening (`bisect_decompose.py`)
+The linear-narrowing heuristic above only re-widens *gradually* (its breathing
+start grows the window 50 %/region), so when a dense middle gives way to an easy
+epilogue it lags, staying narrow. `bisect_decompose.py` instead **binary-searches
+the largest provably-optimal width** per region over `[WMIN, Wmax]`, *seeded at
+the previous region's width*: probe the seed, then search **upward** if it is
+optimal (re-widen) or **downward** if not (narrow). Because the upper bound is
+always `Wmax`, re-widening is *instant* — one O(log) search jumps back to a wide
+window the moment pressure eases.
+
+Demonstrated on a synthetic **low-high-low** pressure profile (`gen_profile.py`:
+reuse window ramps small→large→small, so pressure is low at the ends and high in
+the middle):
+
+| 200 instr, 8 regs, peak 14 | obj | time | width sequence |
+|---|---|---|---|
+| bisect (probe 1 s) | **70** | 46 s | `40, 13,12,12,8,8,7,5, 9,10,7,7,11, `**`40`**`, 11` |
+| linear breathing   | 122 | 12 s | `40,22,19,15,10,10, 7×7, 5×7` (stuck narrow) |
+
+The bisect width sequence re-widens to **40** in the epilogue after the dense
+middle; the breathing heuristic never climbs back (`7×7, 5×7`). Re-widening +
+the true max width per region give the better objective (70 vs 122: more
+compressions, fewer seams). So: **yes, binary search covers re-widening**, and
+better than the breathing heuristic.
+
+Trade-off: bisect costs more probes (~4–5/region vs ~1.5), because confirming a
+maximum requires *speculative* probes just above it that time out at the full
+budget — so it is ~3–4× slower. A shorter probe budget mitigates (knob). Cheaper
+variants that keep most of the re-widening benefit: galloping search
+(seed, 2×, 4×, … then bisect the last bracket) or additive-increase/
+multiplicative-decrease growth, both cutting the speculative high probes.
 
 ## Caveats / next step
 These are **synthetic** instances and the objective is the model's internal
