@@ -47,6 +47,35 @@ Boundary cost is small with adequate windows: on the low-pressure i48 (mono
 optimum −54) decomposition gives −44 (W=20) to −52 (W=30) — a few compressions
 lost at region seams, shrinking as windows grow.
 
+## Adaptive narrowing (`adaptive_decompose.py`)
+The fixed-`W` sweet spot is not uniform — it depends on *local* pressure, so any
+single global `W` is a compromise (and the wrong choice can collapse quality).
+Narrowing removes the knob: from each position try the **widest** window first
+and accept it iff clingo **proves it optimal** within a short probe budget;
+otherwise halve and retry, down to a floor. Wide windows win where the code is
+easy (fewer seams → less boundary loss); the solver narrows automatically where
+it is hard. Two efficiency tricks keep the wasted probes cheap: a short probe
+limit (optimal regions solve fast anyway) and a *breathing* start — each region
+begins near the previous region's accepted width (grown 50 %) instead of always
+at `Wmax`, so sustained hard stretches don't re-probe the maximum every region.
+
+Result (Wmax=40, floor=5, 1 s probe) vs. the best *hand-tuned* fixed window:
+
+| instance | mono 20 s | best fixed-W | adaptive | time | width histogram |
+|---|---|---|---|---|---|
+| i48  | −54  | −52  | −48  | 0.9 s | 40, 8 |
+| i80  | +172 | −52  | −52  | 4.2 s | 40, 13, 10, 10, 7 |
+| i200 | +1334| −206 | **−228** | 8.8 s | 40, 19, 18, 16, 15×2, 14, 13, 12, 11, 10×2, 7 |
+| i400 | +3628| −376 | **−408** | 23.2 s | 40, 19, 16, 15×2, 14, 13×7, 12×2, 11×2, 10×5, 9×7, 8, 7×3, 2 |
+
+Every region is provably optimal, and adaptive **beats the best fixed window**
+on the two larger instances with *no tuning*. The width histograms show the
+intended behaviour: a wide 40-window over the easy prologue, settling to ~10–19
+through the dense body. The probe limit is a clean speed/quality dial — a 2 s
+probe reaches i80 −56 but takes 11 s; 1 s gives −52 in 4 s. (Remaining
+inefficiency: ~half the regions still spend one wasted probe before narrowing;
+a binary search for the max-optimal width would cut that further.)
+
 ## Caveats / next step
 These are **synthetic** instances and the objective is the model's internal
 cost, not measured `.text` vs greedy. The decisive comparison shown here is
