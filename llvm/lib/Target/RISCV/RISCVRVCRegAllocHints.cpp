@@ -153,7 +153,7 @@ static cl::opt<unsigned> RVCHeadroom(
 // pressure below the bar have spare registers, so forcing candidates into GPRC
 // displaces nothing and is a clean compression win.
 static cl::opt<unsigned> RVCMaxPressure(
-    "riscv-asp-rvc-max-pressure", cl::Hidden, cl::init(26),
+    "riscv-asp-rvc-max-pressure", cl::Hidden, cl::init(22),
     cl::desc("Skip the ASP pass in functions whose peak GPR register pressure "
              "exceeds this (already register-bound; intervention backfires)"));
 
