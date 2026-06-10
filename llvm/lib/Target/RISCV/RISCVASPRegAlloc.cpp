@@ -31,6 +31,7 @@
 #include "RISCVSubtarget.h"
 #include "RegAllocGreedy.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/EdgeBundles.h"
@@ -70,6 +71,7 @@ using namespace llvm;
 #define DEBUG_TYPE "riscv-asp-cs"
 
 STATISTIC(NumASPAssigned, "Vregs bound to their ASP-chosen register");
+STATISTIC(NumASPDisplaced, "Vregs the solver chose to displace (spill) ");
 
 static cl::opt<unsigned>
     ASPCSTimeLimit("riscv-asp-cs-time-limit", cl::Hidden, cl::init(10),
@@ -82,6 +84,31 @@ static cl::opt<unsigned>
 static cl::opt<unsigned>
     ASPCSMaxVRegs("riscv-asp-cs-max-vregs", cl::Hidden, cl::init(80),
                   cl::desc("Skip the ASP solve above this many GPR vregs"));
+
+// Pressure gate.  The model spills *whole* ranges and treats interference as
+// whole-range, whereas greedy splits a range and spills/conflicts only on the
+// slice that does not fit -- strictly finer.  So on register-bound functions
+// greedy wins and intervening backfires.  Skip the solve when peak GPR pressure
+// exceeds this bar and run plain greedy; the model then only acts on
+// low-pressure functions, where allocation reduces to the compression-aware
+// assignment subproblem (no spilling needed) and the solver can be optimal.
+// Mirrors the phase-1 pass's gate; 22 was tuned there.
+static cl::opt<unsigned> ASPCSMaxPressure(
+    "riscv-asp-cs-max-pressure", cl::Hidden, cl::init(22),
+    cl::desc("Skip the ASP solve in functions whose peak GPR register pressure "
+             "exceeds this (already register-bound; greedy's splitting wins)"));
+
+// Eviction / displacement modelling.  Leaving a vreg unassigned ("displaced")
+// hands it to greedy, which spills (or splits) it.  We charge that choice in
+// the objective so the solver only displaces a vreg when the compression /
+// coalescing it unblocks for others outweighs the spill code it costs.  The
+// per-reference byte estimate approximates one spill store/reload per static
+// reference; 4 ~= an uncompressed SW/LW.  Set 0 to disable (legacy behaviour:
+// displacement is free and the solver may over-spill).
+static cl::opt<unsigned> ASPCSSpillBytesPerRef(
+    "riscv-asp-cs-spill-bytes-per-ref", cl::Hidden, cl::init(4),
+    cl::desc("Estimated spill-code bytes per static reference, charged in the "
+             "objective for each displaced (unassigned) vreg"));
 
 namespace {
 
@@ -224,11 +251,19 @@ FunctionPass *llvm::createRISCVASPRegAlloc() { return new RISCVASPRegAlloc(); }
 #ifdef LLVM_PBQP_HAVE_CLINGO
 
 // Static policy half of the model.  Dynamic facts are appended per function.
-// Greedy owns spilling, so the model colors the interference graph to maximize
-// realized compressions and eliminated copies, minus callee-saved cost.
+// The model colors the GPR interference graph to maximize realized compressions
+// and eliminated copies, minus callee-saved overhead, minus the spill cost of
+// any vreg it leaves unassigned ("displaced").  A vreg may be assigned at most
+// one register or none; an unassigned vreg is handed to greedy, which spills or
+// splits it.  Charging spill_cost for displacement turns the coloring into a
+// genuine assign-or-spill optimization: the solver assigns every vreg it can,
+// and only displaces a vreg when the compression/coalescing it unblocks for
+// others (or the callee-saved overhead it avoids) outweighs that spill cost.
 static const char *const kASPModel =
     "{ assign(V, R) : reg(R) } 1 :- vreg(V).\n"
     ":- assign(V1, R), assign(V2, R), interfere(V1, V2).\n"
+    "assigned(V) :- assign(V, _).\n"
+    "displaced(V) :- vreg(V), not assigned(V).\n"
     "gprc_ok(V) :- assign(V, R), gprc(R).\n"
     "blocked(I) :- needs_gprc(I, V), not gprc_ok(V).\n"
     "realized(I) :- cand(I), not blocked(I).\n"
@@ -238,6 +273,7 @@ static const char *const kASPModel =
     "#maximize { B@1, realized, I : realized(I), cand_save(I, B) }.\n"
     "#maximize { B@1, coalesced, C : coalesced(C), copy_save(C, B) }.\n"
     "#minimize { N@1, cs, R : used_cs(R), cs_cost(N) }.\n"
+    "#minimize { C@1, spill, V : displaced(V), spill_cost(V, C) }.\n"
     "#show assign/2.\n";
 
 static bool parseAssignAtom(clingo_symbol_t Sym, unsigned &V, unsigned &R) {
@@ -336,6 +372,43 @@ void RISCVASPGreedy::solveASP() {
   ArrayRef<MCPhysReg> Pool = RegClassInfo.getOrder(&RISCV::GPRRegClass);
   if (Pool.empty())
     return;
+
+  // Pressure gate: skip register-bound functions (greedy's splitting wins
+  // there).  Peak concurrent GPR vregs, via an interval-endpoint sweep over
+  // every GPR-allocatable virtual register.  Start (+1) events sort before end
+  // (-1) at a shared point, so a value live exactly up to where another begins
+  // is counted as concurrent (conservative -> gate slightly more).
+  {
+    SmallVector<std::pair<SlotIndex, int>, 256> Ev;
+    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
+      Register R = Register::index2VirtReg(I);
+      if (MRI->reg_nodbg_empty(R) || !LIS->hasInterval(R) ||
+          !MRI->getRegClass(R)->contains(RISCV::X10))
+        continue;
+      for (const auto &S : LIS->getInterval(R)) {
+        Ev.emplace_back(S.start, +1);
+        Ev.emplace_back(S.end, -1);
+      }
+    }
+    std::sort(Ev.begin(), Ev.end(),
+              [](const std::pair<SlotIndex, int> &A,
+                 const std::pair<SlotIndex, int> &B) {
+                if (A.first != B.first)
+                  return A.first < B.first;
+                return A.second > B.second; // +1 before -1
+              });
+    int Cur = 0, Peak = 0;
+    for (auto &E : Ev) {
+      Cur += E.second;
+      Peak = std::max(Peak, Cur);
+    }
+    if ((unsigned)Peak > ASPCSMaxPressure) {
+      LLVM_DEBUG(dbgs() << "RISCV-ASP-CS: skip " << MF.getName() << " (pressure "
+                        << Peak << " > " << ASPCSMaxPressure << ")\n");
+      return;
+    }
+  }
+
   DenseMap<MCRegister, unsigned> RegId;
   for (unsigned I = 0; I < Pool.size(); ++I)
     RegId[Pool[I]] = I;
@@ -487,8 +560,20 @@ void RISCVASPGreedy::solveASP() {
   }
   unsigned CsCost = (ST.hasStdExtZcmp() || ST.enableSaveRestore()) ? 1 : 4;
   F << "cs_cost(" << CsCost << ").\n";
-  for (unsigned I = 0; I < IdToVReg.size(); ++I)
-    F << "vreg(" << I << ").\n";
+  for (unsigned I = 0; I < IdToVReg.size(); ++I) {
+    F << "vreg(" << I << ").";
+    // Spill cost charged if the solver leaves this vreg displaced: one
+    // store/reload (~ASPCSSpillBytesPerRef bytes) per static reference.  A
+    // floor of 2 keeps even a single-reference vreg non-free to displace.
+    if (ASPCSSpillBytesPerRef) {
+      SmallPtrSet<const MachineInstr *, 8> Refs;
+      for (const MachineOperand &MO : MRI->reg_nodbg_operands(IdToVReg[I]))
+        Refs.insert(MO.getParent());
+      unsigned Cost = std::max<unsigned>(2, Refs.size() * ASPCSSpillBytesPerRef);
+      F << " spill_cost(" << I << ", " << Cost << ").";
+    }
+    F << "\n";
+  }
   for (unsigned A = 0; A < IdToVReg.size(); ++A)
     for (unsigned B = A + 1; B < IdToVReg.size(); ++B)
       if (LIS->getInterval(IdToVReg[A]).overlaps(LIS->getInterval(IdToVReg[B])))
@@ -519,7 +604,14 @@ void RISCVASPGreedy::solveASP() {
   for (auto [VIdx, RIdx] : Assignment)
     if (VIdx < IdToVReg.size() && RIdx < Pool.size())
       ASPChoice[IdToVReg[VIdx]] = Pool[RIdx];
-  LLVM_DEBUG(dbgs() << "RISCV-ASP-CS: " << ASPChoice.size() << " bindings for "
+  // Vregs the solver presented to the model but chose not to assign were
+  // displaced (deemed cheaper to spill than to keep, given what their register
+  // unblocks for others).  The model enforces at most one assign per vreg, so
+  // displaced == modelled vregs minus distinct assignments.
+  if (IdToVReg.size() > Assignment.size())
+    NumASPDisplaced += IdToVReg.size() - Assignment.size();
+  LLVM_DEBUG(dbgs() << "RISCV-ASP-CS: " << ASPChoice.size() << " bindings, "
+                    << (IdToVReg.size() - Assignment.size()) << " displaced for "
                     << MF.getName() << "\n");
 }
 
