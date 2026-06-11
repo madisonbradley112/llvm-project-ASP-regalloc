@@ -38,7 +38,9 @@ if [ ${#BENCHES[@]} -eq 0 ]; then
 fi
 
 CXXINC=(-isystem "$INC/c++/13.2.0" -isystem "$INC/c++/13.2.0/riscv64-unknown-elf")
-COMMON=(--target=$TARGET $MABI -isystem "$INC" -march=$MARCH $OPT -w -DSPEC_CPU -DNDEBUG)
+# -DSPEC_CPU_LINUX is the SPEC portability define for a Linux-style build; without
+# it several benchmarks (e.g. libquantum's config.h MAX_UNSIGNED) fail to compile.
+COMMON=(--target=$TARGET $MABI -isystem "$INC" -march=$MARCH $OPT -w -DSPEC_CPU -DSPEC_CPU_LINUX -DNDEBUG)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
