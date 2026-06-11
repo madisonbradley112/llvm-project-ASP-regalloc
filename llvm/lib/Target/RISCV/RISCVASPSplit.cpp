@@ -27,12 +27,15 @@
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
@@ -70,9 +73,9 @@ static cl::opt<unsigned> ASPSplitTimeLimit(
     cl::desc("Per-region clingo wall-clock time limit (seconds)"));
 
 static cl::opt<unsigned> ASPSplitWindow(
-    "riscv-asp-split-window", cl::Hidden, cl::init(24),
-    cl::desc("Max program points per region; larger blocks are split into "
-             "windows of this size solved left-to-right"));
+    "riscv-asp-split-window", cl::Hidden, cl::init(16),
+    cl::desc("Program points per window; blocks are decomposed into windows of "
+             "this size solved left-to-right with frozen boundaries"));
 
 static cl::opt<unsigned> ASPSplitMaxBlock(
     "riscv-asp-split-max-points", cl::Hidden, cl::init(2000),
@@ -92,6 +95,10 @@ static const char *const kSplitModel =
     ":- inreg(V,P-1,R1), inreg(V,P,R2), R1 != R2.\n"
     "reload(V,P) :- inreg(V,P,_), live(V,P-1), inmem(V,P-1).\n"
     "store(V,P)  :- inmem(V,P),   live(V,P-1), inreg(V,P-1,_).\n"
+    // Block-local splitting: a value crossing the block boundary must stay in a
+    // register there, so any spill is stored AND reloaded within this block
+    // (cross-block liveness stays register-resident -- no dangling reloads).
+    ":- inmem(V,P), pin(V,P).\n"
     ":- inreg(V,Lo,R2), first(Lo), frozen_reg(V,R1), R1 != R2.\n"
     "reload(V,Lo) :- inreg(V,Lo,_), first(Lo), frozen_mem(V).\n"
     "store(V,Lo)  :- inmem(V,Lo),  first(Lo), frozen_reg(V,_).\n"
@@ -210,7 +217,8 @@ public:
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.setPreservesAll();
+    // We rewrite the MIR (insert spill/reload), so we do NOT preserve liveness;
+    // LiveIntervals/SlotIndexes are recomputed for the register allocator.
     AU.addRequired<LiveIntervalsWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
@@ -219,14 +227,31 @@ public:
 
 private:
 #ifdef LLVM_PBQP_HAVE_CLINGO
+  // A value to split within a block: store it at each reg->mem transition point
+  // and reload it (into a fresh vreg, rewriting later uses) at each mem->reg
+  // transition point.  Point indices are into the owning BlockPlan's Pts.
+  struct VSplit {
+    Register V;
+    SmallVector<unsigned, 4> StorePts;  // reg -> mem (store current vreg)
+    SmallVector<unsigned, 4> ReloadPts; // mem -> reg (reload into a new vreg)
+  };
+  struct BlockPlan {
+    SmallVector<MachineInstr *, 0> Pts; // program points (MI pointers, stable)
+    SmallVector<VSplit, 0> Splits;
+  };
+  std::vector<BlockPlan> Plans;
+  DenseSet<Register> GPRCWanted; // values to constrain to GPRC (compression)
+
   // Detect whether MI has an RVC-compressible form gated on some of its GPR
   // operands being in GPRC; append those vreg operands to Need.  Mirrors the
   // classifier in RISCVASPRegAlloc.cpp.
   bool classify(const MachineInstr &MI, const RISCVSubtarget &ST,
                 SmallVectorImpl<Register> &Need) const;
-  // Solve one basic block (windowed) and dump the decisions.
+  // Solve one basic block and record split (store/reload) + GPRC actions.
   void solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
                   MachineRegisterInfo &MRI, const RISCVSubtarget &ST);
+  // Apply all recorded actions to the MIR; returns true if anything changed.
+  bool applyActions(MachineFunction &MF, const RISCVSubtarget &ST);
 #endif
 };
 
@@ -342,12 +367,11 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
     return (int)Id;
   };
 
-  // Per-point liveness/use/def and compression candidates.
-  std::ostringstream F;
-  // Track, per vreg id, the live point range within this block.
-  DenseMap<unsigned, std::pair<int, int>> LiveRange; // id -> [lo,hi]
-  std::vector<std::string> UseDef;                   // use/def facts
-  std::vector<std::string> Cands;                    // cand facts
+  // Per-point liveness/use/def and compression candidates (structured so we can
+  // emit per-window subsets during the windowed decomposition below).
+  DenseMap<unsigned, std::pair<int, int>> LiveRange;    // id -> [lo,hi]
+  std::vector<std::pair<unsigned, unsigned>> Uses, Defs; // (id, point)
+  std::vector<std::pair<unsigned, unsigned>> CandVP;     // (point, vreg id)
   unsigned CandId = 0;
 
   for (unsigned P = 0; P < N; ++P) {
@@ -362,11 +386,9 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
       LR.first = std::min(LR.first, (int)P);
       LR.second = std::max(LR.second, (int)P);
       if (MO.isDef())
-        UseDef.push_back("def(" + std::to_string(Id) + "," +
-                         std::to_string(P) + ").");
+        Defs.emplace_back((unsigned)Id, P);
       if (MO.readsReg())
-        UseDef.push_back("use(" + std::to_string(Id) + "," +
-                         std::to_string(P) + ").");
+        Uses.emplace_back((unsigned)Id, P);
     }
     // Compression candidates at this point.
     SmallVector<Register, 3> Need;
@@ -379,9 +401,7 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
         }
       if (Ok) {
         for (Register R : Need)
-          Cands.push_back("cand(c" + std::to_string(CandId) + "," +
-                          std::to_string(VId[R]) + "," + std::to_string(P) +
-                          ").");
+          CandVP.emplace_back(P, VId[R]);
         ++CandId;
       }
     }
@@ -390,65 +410,210 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
   if (IdToV.empty())
     return;
 
-  // Extend live ranges for values live-in/out of the block (occupy a register
-  // across the whole block on that side).
+  // Identify values that cross the block boundary; pin them to a register there
+  // so any spill is balanced (stored AND reloaded) inside this block.
   SlotIndex BBStart = LIS.getInstructionIndex(*Pts.front()).getBaseIndex();
   SlotIndex BBEnd = LIS.getInstructionIndex(*Pts.back()).getRegSlot();
+  std::vector<bool> LiveIn(IdToV.size(), false), LiveOut(IdToV.size(), false);
   for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
     const LiveInterval &LI = LIS.getInterval(IdToV[Id]);
     auto &LR = LiveRange[Id];
-    if (LI.liveAt(BBStart))
+    if (LI.liveAt(BBStart)) {
       LR.first = 0;
-    if (LI.liveAt(BBEnd))
+      LiveIn[Id] = true;
+    }
+    if (LI.liveAt(BBEnd)) {
       LR.second = (int)N - 1;
+      LiveOut[Id] = true;
+    }
   }
 
-  // Emit the program.  (Stage 1: per-block, no cross-block freezing yet.)
-  F << "point(0.." << (N - 1) << ").\n";
+  // Static facts (registers + costs), shared by every window.
+  std::vector<bool> IsGPRC(Regs.size(), false);
+  std::ostringstream RF;
   for (unsigned I = 0; I < Regs.size(); ++I) {
-    F << "reg(" << I << ").";
-    if (RISCV::GPRCRegClass.contains(Regs[I]))
-      F << " gprc(" << I << ").";
-    F << "\n";
+    RF << "reg(" << I << ").";
+    if (RISCV::GPRCRegClass.contains(Regs[I])) {
+      RF << " gprc(" << I << ").";
+      IsGPRC[I] = true;
+    }
+    RF << "\n";
   }
-  F << "storecost(4). reloadcost(4). compsave(2).\n";
-  for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
-    auto &LR = LiveRange[Id];
-    F << "live(" << Id << "," << LR.first << ".." << LR.second << ").\n";
-  }
-  for (auto &S : UseDef)
-    F << S << "\n";
-  for (auto &S : Cands)
-    F << S << "\n";
+  RF << "storecost(4). reloadcost(4). compsave(2).\n";
+  std::string RegFacts = RF.str();
 
-  std::string Program = std::string(kSplitModel) + F.str();
-#ifdef LLVM_PBQP_HAVE_CLINGO
-  std::vector<Loc> Sol;
-  if (!runSplitSolve(Program, ASPSplitTimeLimit, Sol))
+  // Decompose the block into consecutive windows solved left-to-right; each
+  // window is frozen at its entry to the previous window's exit locations.  This
+  // is the tractable path: small windows solve fast (and usually optimally),
+  // whereas one monolithic per-block solve times out on large blocks.  Point
+  // numbers are absolute, so a window is just point(Lo..Hi) + in-range facts.
+  unsigned W = std::max(2u, (unsigned)ASPSplitWindow);
+  DenseMap<std::pair<unsigned, unsigned>, unsigned> RegAt; // (id,point) -> regid
+  DenseMap<unsigned, int> ExitReg; // id -> regid at prev window's last point (-1=mem)
+  bool AnyWindowSolved = false;
+  for (unsigned Lo = 0; Lo < N; Lo += W) {
+    unsigned Hi = std::min(Lo + W - 1, N - 1);
+    std::ostringstream F;
+    F << "point(" << Lo << ".." << Hi << ").\nfirst(" << Lo << ").\n" << RegFacts;
+    for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
+      auto &LR = LiveRange[Id];
+      int A = LR.first, B = LR.second;
+      if (A > (int)Hi || B < (int)Lo)
+        continue; // not live in this window
+      int WLo = std::max(A, (int)Lo), WHi = std::min(B, (int)Hi);
+      F << "live(" << Id << "," << WLo << ".." << WHi << ").\n";
+      if (LiveOut[Id])
+        for (int P = WLo; P <= WHi; ++P)
+          F << "pin(" << Id << "," << P << ").\n";
+      else if (LiveIn[Id] && A == 0 && Lo == 0)
+        F << "pin(" << Id << ",0).\n";
+      // Freeze a (splittable) value's entry to the previous window's exit.
+      if (A < (int)Lo && !LiveOut[Id]) {
+        auto It = ExitReg.find(Id);
+        if (It != ExitReg.end()) {
+          if (It->second >= 0)
+            F << "frozen_reg(" << Id << "," << It->second << ").\n";
+          else
+            F << "frozen_mem(" << Id << ").\n";
+        }
+      }
+    }
+    for (auto &U : Uses)
+      if (U.second >= Lo && U.second <= Hi)
+        F << "use(" << U.first << "," << U.second << ").\n";
+    for (auto &D : Defs)
+      if (D.second >= Lo && D.second <= Hi)
+        F << "def(" << D.first << "," << D.second << ").\n";
+    unsigned C = 0;
+    for (auto &PV : CandVP)
+      if (PV.first >= Lo && PV.first <= Hi)
+        F << "cand(c" << (C++) << "," << PV.second << "," << PV.first << ").\n";
+
+    std::string Program = std::string(kSplitModel) + F.str();
+    std::vector<Loc> Sol;
+    if (runSplitSolve(Program, ASPSplitTimeLimit, Sol)) {
+      AnyWindowSolved = true;
+      for (const Loc &L : Sol)
+        RegAt[{L.V, L.P}] = L.R;
+    }
+    // Record exit locations at Hi to freeze the next window's entry.
+    ExitReg.clear();
+    for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
+      auto &LR = LiveRange[Id];
+      if (LR.first <= (int)Hi && LR.second >= (int)Hi) {
+        auto It = RegAt.find({Id, Hi});
+        ExitReg[Id] = It != RegAt.end() ? (int)It->second : -1;
+      }
+    }
+  }
+  if (!AnyWindowSolved)
     return;
   ++NumBlocksSolved;
 
-  // Decode: for each value, which points are in a register (and which reg).
-  // A value is "split" if it is in a register at some live point and in memory
-  // at another.
-  DenseMap<unsigned, unsigned> InRegCount;
-  for (const Loc &L : Sol)
-    ++InRegCount[L.V];
+  auto inReg = [&](unsigned Id, int P) {
+    return RegAt.count({Id, (unsigned)P}) != 0;
+  };
+
+  // Record store/reload transition points per value (relative to this block).
+  BlockPlan BP;
   unsigned LocalSplit = 0;
   for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
+    if (LiveOut[Id])
+      continue; // never split (see pin emission)
     auto &LR = LiveRange[Id];
-    unsigned LivePts = (unsigned)(LR.second - LR.first + 1);
-    unsigned InReg = InRegCount.lookup(Id);
-    if (InReg > 0 && InReg < LivePts) {
+    VSplit VS;
+    VS.V = IdToV[Id];
+    for (int P = LR.first + 1; P <= LR.second; ++P) {
+      bool Prev = inReg(Id, P - 1), Cur = inReg(Id, P);
+      if (Prev && !Cur)
+        VS.StorePts.push_back((unsigned)P);
+      else if (!Prev && Cur)
+        VS.ReloadPts.push_back((unsigned)P);
+    }
+    if (!VS.StorePts.empty() || !VS.ReloadPts.empty()) {
+      BP.Splits.push_back(std::move(VS));
       ++LocalSplit;
       ++NumValuesSplit;
     }
   }
+  if (!BP.Splits.empty()) {
+    BP.Pts.assign(Pts.begin(), Pts.end());
+    Plans.push_back(std::move(BP));
+  }
+
+  // Mark values placed in a GPRC register at a candidate point: constrain them
+  // to GPRC so greedy realizes the compression.
+  for (auto &PV : CandVP) {
+    auto It = RegAt.find({PV.second, PV.first});
+    if (It != RegAt.end() && It->second < IsGPRC.size() && IsGPRC[It->second]) {
+      GPRCWanted.insert(IdToV[PV.second]);
+      ++NumRealized;
+    }
+  }
+
   LLVM_DEBUG(dbgs() << "  [asp-split] " << MBB.getParent()->getName() << ":"
                     << MBB.getName() << " points=" << N
                     << " vregs=" << IdToV.size() << " cands=" << CandId
                     << " split=" << LocalSplit << "\n");
-#endif
+}
+
+// Materialize the recorded split plans (SSA-preserving): for each value, walk
+// the block in order, store the current vreg at each reg->mem point, reload into
+// a FRESH vreg at each mem->reg point, and rewrite that value's operands in the
+// remaining instructions to the current vreg.  This gives the value a holed live
+// range (dead across the spilled gaps) without breaking SSA.  Also constrain the
+// marked values to GPRC.  Liveness is recomputed afterwards (not preserved).
+bool RISCVASPSplit::applyActions(MachineFunction &MF, const RISCVSubtarget &ST) {
+  if (Plans.empty() && GPRCWanted.empty())
+    return false;
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  const TargetInstrInfo *TII = ST.getInstrInfo();
+  const TargetRegisterInfo *TRI = ST.getRegisterInfo();
+
+  DenseMap<Register, int> Slot;
+  auto getSlot = [&](Register V, const TargetRegisterClass *RC) -> int {
+    auto It = Slot.find(V);
+    if (It != Slot.end())
+      return It->second;
+    int FI = MFI.CreateSpillStackObject(TRI->getSpillSize(*RC),
+                                        TRI->getSpillAlign(*RC));
+    Slot[V] = FI;
+    return FI;
+  };
+
+  bool Changed = false;
+  for (BlockPlan &BP : Plans) {
+    for (VSplit &VS : BP.Splits) {
+      const TargetRegisterClass *RC = MRI.getRegClass(VS.V);
+      int FI = getSlot(VS.V, RC);
+      DenseSet<unsigned> StoreAt(VS.StorePts.begin(), VS.StorePts.end());
+      DenseSet<unsigned> ReloadAt(VS.ReloadPts.begin(), VS.ReloadPts.end());
+      Register Cur = VS.V;
+      for (unsigned P = 0; P < BP.Pts.size(); ++P) {
+        MachineInstr *MI = BP.Pts[P];
+        MachineBasicBlock &MBB = *MI->getParent();
+        MachineBasicBlock::iterator It = MI->getIterator();
+        if (ReloadAt.count(P)) {
+          Register NV = MRI.createVirtualRegister(RC);
+          TII->loadRegFromStackSlot(MBB, It, NV, FI, RC, TRI, NV);
+          Cur = NV;
+        }
+        if (StoreAt.count(P))
+          TII->storeRegToStackSlot(MBB, It, Cur, /*isKill=*/false, FI, RC, TRI,
+                                   Cur);
+        if (Cur != VS.V)
+          for (MachineOperand &MO : MI->operands())
+            if (MO.isReg() && MO.getReg() == VS.V)
+              MO.setReg(Cur);
+      }
+      Changed = true;
+    }
+  }
+  for (Register V : GPRCWanted)
+    if (MRI.constrainRegClass(V, &RISCV::GPRCRegClass))
+      Changed = true;
+  return Changed;
 }
 
 #endif // LLVM_PBQP_HAVE_CLINGO
@@ -463,11 +628,17 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
   ++NumFuncs;
   LiveIntervals &LIS = getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   MachineRegisterInfo &MRI = MF.getRegInfo();
+  Plans.clear();
+  GPRCWanted.clear();
   LLVM_DEBUG(dbgs() << "[asp-split] function " << MF.getName() << "\n");
+  // Phase A: solve every block against the original liveness, recording actions.
   for (MachineBasicBlock &MBB : MF)
     solveBlock(MBB, LIS, MRI, ST);
+  // Phase B: materialize them (mutates the MIR; liveness recomputed for RA).
+  return applyActions(MF, ST);
+#else
+  return false;
 #endif
-  return false; // Stage 1 dumps decisions only; no IR changes yet.
 }
 
 } // end anonymous namespace
