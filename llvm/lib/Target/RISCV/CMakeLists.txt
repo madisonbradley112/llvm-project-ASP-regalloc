@@ -63,6 +63,7 @@ add_llvm_target(RISCVCodeGen
   RISCVRegisterInfo.cpp
   RISCVRVCRegAllocHints.cpp
   RISCVASPRegAlloc.cpp
+  RISCVASPSplit.cpp
   RISCVSelectionDAGInfo.cpp
   RISCVSubtarget.cpp
   RISCVTargetMachine.cpp

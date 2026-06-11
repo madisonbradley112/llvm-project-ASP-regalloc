@@ -37,6 +37,9 @@ void initializeRISCVRVCRegAllocHintsPass(PassRegistry &);
 FunctionPass *createRISCVASPRegAlloc();
 void initializeRISCVASPRegAllocPass(PassRegistry &);
 
+FunctionPass *createRISCVASPSplitPass();
+void initializeRISCVASPSplitPass(PassRegistry &);
+
 FunctionPass *createRISCVIndirectBranchTrackingPass();
 void initializeRISCVIndirectBranchTrackingPass(PassRegistry &);
 
