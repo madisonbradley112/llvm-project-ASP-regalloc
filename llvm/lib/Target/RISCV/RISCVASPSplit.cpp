@@ -345,10 +345,15 @@ bool RISCVASPSplit::classify(const MachineInstr &MI, const RISCVSubtarget &ST,
 void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
                                MachineRegisterInfo &MRI,
                                const RISCVSubtarget &ST) {
-  // Linearize the block into program points (one per non-debug instruction).
+  // Linearize the block into program points (one per non-debug, non-PHI
+  // instruction).  PHIs are excluded: the function is still in SSA form here, so
+  // PHIs must stay at the block head -- we must not treat them as split points
+  // or insert spill/reload code among them.  Values defined or used by PHIs are
+  // live across the block boundary, hence pinned (never split), so skipping the
+  // PHIs themselves is safe; we only insert reloads/stores after the PHI region.
   SmallVector<MachineInstr *, 64> Pts;
   for (MachineInstr &MI : MBB)
-    if (!MI.isDebugInstr())
+    if (!MI.isDebugInstr() && !MI.isPHI())
       Pts.push_back(&MI);
   unsigned N = Pts.size();
   if (N == 0 || N > ASPSplitMaxBlock)
