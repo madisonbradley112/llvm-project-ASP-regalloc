@@ -74,8 +74,12 @@ static cl::opt<unsigned> ASPSplitTimeLimit(
 
 static cl::opt<unsigned> ASPSplitWindow(
     "riscv-asp-split-window", cl::Hidden, cl::init(16),
-    cl::desc("Program points per window; blocks are decomposed into windows of "
-             "this size solved left-to-right with frozen boundaries"));
+    cl::desc("Max window size (points) for the binary-search window sizer; "
+             "blocks are decomposed into windows solved left-to-right"));
+
+static cl::opt<unsigned> ASPSplitWindowMin(
+    "riscv-asp-split-window-min", cl::Hidden, cl::init(4),
+    cl::desc("Min window size (points) the binary-search sizer narrows to"));
 
 static cl::opt<unsigned> ASPSplitMaxBlock(
     "riscv-asp-split-max-points", cl::Hidden, cl::init(2000),
@@ -136,9 +140,12 @@ static bool parseInreg(clingo_symbol_t Sym, unsigned &V, unsigned &P,
 }
 
 // Solve one region program; return the best model's inreg atoms.  Returns false
-// only if no model was found at all.
+// only if no model was found at all.  Sets Optimal=true iff clingo proved the
+// result optimal (search space exhausted) within the budget -- used by the
+// binary-search window sizing to decide whether to widen or narrow.
 static bool runSplitSolve(const std::string &Program, unsigned TimeLimitSecs,
-                          std::vector<Loc> &Out) {
+                          std::vector<Loc> &Out, bool &Optimal) {
+  Optimal = false;
   clingo_control_t *Ctl = nullptr;
   char const *Args[] = {"--opt-mode=opt"};
   auto Logger = [](clingo_warning_t, char const *, void *) {};
@@ -198,6 +205,11 @@ static bool runSplitSolve(const std::string &Program, unsigned TimeLimitSecs,
   }
   Done.store(true, std::memory_order_relaxed);
   Timeout.join();
+  // Whether the optimum was proved (search exhausted, not interrupted/timed out).
+  clingo_solve_result_bitset_t Res = 0;
+  if (clingo_solve_handle_get(Handle, &Res))
+    Optimal = (Res & clingo_solve_result_exhausted) &&
+              !(Res & clingo_solve_result_interrupted);
   clingo_solve_handle_close(Handle);
   Cleanup();
   if (!FoundAny)
@@ -442,24 +454,24 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
   RF << "storecost(4). reloadcost(4). compsave(2).\n";
   std::string RegFacts = RF.str();
 
-  // Decompose the block into consecutive windows solved left-to-right; each
-  // window is frozen at its entry to the previous window's exit locations.  This
-  // is the tractable path: small windows solve fast (and usually optimally),
-  // whereas one monolithic per-block solve times out on large blocks.  Point
-  // numbers are absolute, so a window is just point(Lo..Hi) + in-range facts.
-  unsigned W = std::max(2u, (unsigned)ASPSplitWindow);
+  unsigned Wmax = std::max(2u, (unsigned)ASPSplitWindow);
+  unsigned Wmin = std::max(2u, (unsigned)ASPSplitWindowMin);
   DenseMap<std::pair<unsigned, unsigned>, unsigned> RegAt; // (id,point) -> regid
   DenseMap<unsigned, int> ExitReg; // id -> regid at prev window's last point (-1=mem)
   bool AnyWindowSolved = false;
-  for (unsigned Lo = 0; Lo < N; Lo += W) {
-    unsigned Hi = std::min(Lo + W - 1, N - 1);
+
+  // Build and solve the window [Lo, Lo+Width-1] against the current ExitReg
+  // frozen boundary; fills Sol and Optimal, returns whether a model was found.
+  auto solveWin = [&](unsigned Lo, unsigned Width, std::vector<Loc> &Sol,
+                      bool &Optimal) -> bool {
+    unsigned Hi = std::min(Lo + Width - 1, N - 1);
     std::ostringstream F;
     F << "point(" << Lo << ".." << Hi << ").\nfirst(" << Lo << ").\n" << RegFacts;
     for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
       auto &LR = LiveRange[Id];
       int A = LR.first, B = LR.second;
       if (A > (int)Hi || B < (int)Lo)
-        continue; // not live in this window
+        continue;
       int WLo = std::max(A, (int)Lo), WHi = std::min(B, (int)Hi);
       F << "live(" << Id << "," << WLo << ".." << WHi << ").\n";
       if (LiveOut[Id])
@@ -467,15 +479,12 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
           F << "pin(" << Id << "," << P << ").\n";
       else if (LiveIn[Id] && A == 0 && Lo == 0)
         F << "pin(" << Id << ",0).\n";
-      // Freeze a (splittable) value's entry to the previous window's exit.
       if (A < (int)Lo && !LiveOut[Id]) {
         auto It = ExitReg.find(Id);
-        if (It != ExitReg.end()) {
-          if (It->second >= 0)
-            F << "frozen_reg(" << Id << "," << It->second << ").\n";
-          else
-            F << "frozen_mem(" << Id << ").\n";
-        }
+        if (It != ExitReg.end())
+          F << (It->second >= 0 ? "frozen_reg(" + std::to_string(Id) + "," +
+                                      std::to_string(It->second) + ").\n"
+                                : "frozen_mem(" + std::to_string(Id) + ").\n");
       }
     }
     for (auto &U : Uses)
@@ -488,15 +497,68 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
     for (auto &PV : CandVP)
       if (PV.first >= Lo && PV.first <= Hi)
         F << "cand(c" << (C++) << "," << PV.second << "," << PV.first << ").\n";
-
     std::string Program = std::string(kSplitModel) + F.str();
-    std::vector<Loc> Sol;
-    if (runSplitSolve(Program, ASPSplitTimeLimit, Sol)) {
+    return runSplitSolve(Program, ASPSplitTimeLimit, Sol, Optimal);
+  };
+
+  // Adaptive ("binary search") window sizing: from each position find the
+  // LARGEST window in [Wmin, Wmax] clingo proves optimal within the budget,
+  // seeded at the previous window's width.  If the seed proves optimal, search
+  // UPWARD (re-widen); else search DOWNWARD (narrow).  The Wmax ceiling makes
+  // re-widening instant when pressure eases.  (Mirrors bisect_decompose.py.)
+  unsigned Seed = Wmax;
+  for (unsigned Lo = 0; Lo < N;) {
+    unsigned Cap = std::min(Wmax, (unsigned)(N - Lo));
+    unsigned S = std::max(Wmin, std::min(Seed, Cap));
+    std::vector<Loc> SeedSol, BestSol;
+    bool SeedOpt = false;
+    bool SeedFound = solveWin(Lo, S, SeedSol, SeedOpt);
+    unsigned BestW = 0; // largest width proven optimal (0 = none yet)
+    if (SeedOpt) {
+      BestSol = SeedSol;
+      BestW = S;
+      for (unsigned A = S + 1, B = Cap; A <= B;) { // re-widen
+        unsigned M = (A + B) / 2;
+        std::vector<Loc> Sc;
+        bool O = false;
+        solveWin(Lo, M, Sc, O);
+        if (O) { BestSol = std::move(Sc); BestW = M; A = M + 1; }
+        else { if (M == 0) break; B = M - 1; }
+      }
+    } else if (S > Wmin) {
+      for (unsigned A = Wmin, B = S - 1; A <= B;) { // narrow
+        unsigned M = (A + B) / 2;
+        std::vector<Loc> Sc;
+        bool O = false;
+        solveWin(Lo, M, Sc, O);
+        if (O) { BestSol = std::move(Sc); BestW = M; A = M + 1; }
+        else { if (M == 0) break; B = M - 1; }
+      }
+    }
+
+    unsigned ChosenW;
+    std::vector<Loc> ChosenSol;
+    bool Found;
+    if (BestW != 0) { // got a proven-optimal window
+      ChosenW = BestW;
+      ChosenSol = std::move(BestSol);
+      Found = true;
+    } else if (SeedFound && S == Wmin) { // seed already minimal
+      ChosenW = S;
+      ChosenSol = std::move(SeedSol);
+      Found = true;
+    } else { // nothing optimal: fall back to the smallest window, best-effort
+      ChosenW = Wmin;
+      bool O = false;
+      Found = solveWin(Lo, Wmin, ChosenSol, O);
+    }
+
+    unsigned Hi = std::min(Lo + ChosenW - 1, N - 1);
+    if (Found) {
       AnyWindowSolved = true;
-      for (const Loc &L : Sol)
+      for (const Loc &L : ChosenSol)
         RegAt[{L.V, L.P}] = L.R;
     }
-    // Record exit locations at Hi to freeze the next window's entry.
     ExitReg.clear();
     for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
       auto &LR = LiveRange[Id];
@@ -505,6 +567,8 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
         ExitReg[Id] = It != RegAt.end() ? (int)It->second : -1;
       }
     }
+    Seed = ChosenW;
+    Lo = Hi + 1;
   }
   if (!AnyWindowSolved)
     return;
