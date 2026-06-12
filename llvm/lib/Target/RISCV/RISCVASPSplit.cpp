@@ -74,6 +74,8 @@ STATISTIC(NumWindowsNoModel, "Windows where no model was found (e.g. UNSAT)");
 STATISTIC(NumSplitsSkippedGap, "Value splits skipped: range crosses an "
                                "unsolved (no-model) window");
 STATISTIC(NumGPRCConstrained, "Vregs successfully constrained to GPRC");
+STATISTIC(NumNaiveGatePassed, "Functions passing the naive thrash gate");
+STATISTIC(NumNaiveGateSkipped, "Functions skipped by the naive thrash gate");
 
 static cl::opt<bool> EnableASPSplit(
     "riscv-asp-split", cl::Hidden, cl::init(false),
@@ -108,6 +110,26 @@ static cl::opt<bool> ASPSplitConstraintsOnly(
     "riscv-asp-split-constraints-only", cl::Hidden, cl::init(false),
     cl::desc("Apply only the GPRC class constraints from the solve; never "
              "materialize live-range splits"));
+
+// Thrash gate for the naive mode: class-narrowing only helps where greedy
+// churns, i.e. where block-crossing liveness oversubscribes the register file
+// (the same quantity whose excess makes the per-window model pigeonhole-UNSAT).
+// Apply the naive constraints only in functions where some block has at least
+// this many GPR vregs live at entry.  0 disables the gate (constrain
+// everywhere).
+static cl::opt<unsigned> ASPSplitNaiveGate(
+    "riscv-asp-split-naive-gate", cl::Hidden, cl::init(0),
+    cl::desc("Naive mode: require a block with >= this many live-at-entry GPR "
+             "vregs before constraining (0 = ungated)"));
+
+// Upper bound of the band: at EXTREME contention (live-at-entry many times the
+// register file) nearly everything spills regardless, and narrowing only
+// removes flexibility (blocksort maxLT=74, sjeng main maxLT=196 both regress).
+// The hypothesis is that narrowing helps in a moderate-contention band.
+static cl::opt<unsigned> ASPSplitNaiveGateMax(
+    "riscv-asp-split-naive-gate-max", cl::Hidden, cl::init(0),
+    cl::desc("Naive mode: skip functions whose max live-at-entry GPR vreg "
+             "count exceeds this (0 = no upper bound)"));
 
 namespace {
 
@@ -767,9 +789,44 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
   GPRCWanted.clear();
   LLVM_DEBUG(dbgs() << "[asp-split] function " << MF.getName() << "\n");
   if (ASPSplitNaiveGPRC) {
-    // Ablation arm: no solver.  Constrain every compression-candidate vreg to
-    // GPRC, including mutually-interfering sets the solver would have thinned.
-    (void)LIS;
+    // No solver.  Constrain every compression-candidate vreg to GPRC,
+    // optionally gated to functions where greedy will actually churn.
+    if (ASPSplitNaiveGate > 0 || ASPSplitNaiveGateMax > 0) {
+      // Max over blocks of GPR vregs live at block entry, via a diff-array
+      // over the (layout-ordered, ascending) block start indices.
+      SlotIndexes *SI = LIS.getSlotIndexes();
+      SmallVector<SlotIndex, 64> Starts;
+      for (MachineBasicBlock &MBB : MF)
+        Starts.push_back(SI->getMBBStartIdx(&MBB));
+      std::vector<int> Diff(Starts.size() + 1, 0);
+      for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
+        Register R = Register::index2VirtReg(I);
+        if (MRI.reg_nodbg_empty(R) || !LIS.hasInterval(R) ||
+            !MRI.getRegClass(R)->contains(RISCV::X10))
+          continue;
+        for (const auto &Seg : LIS.getInterval(R)) {
+          auto Lo = llvm::lower_bound(Starts, Seg.start);
+          auto Hi = llvm::lower_bound(Starts, Seg.end);
+          ++Diff[Lo - Starts.begin()];
+          --Diff[Hi - Starts.begin()];
+        }
+      }
+      int Cur = 0, MaxLT = 0;
+      for (size_t I = 0; I < Starts.size(); ++I) {
+        Cur += Diff[I];
+        MaxLT = std::max(MaxLT, Cur);
+      }
+      LLVM_DEBUG(dbgs() << "[asp-split-naive] " << MF.getName()
+                        << " maxLiveAtEntry=" << MaxLT << " gate="
+                        << ASPSplitNaiveGate << ":" << ASPSplitNaiveGateMax
+                        << "\n");
+      if ((unsigned)MaxLT < ASPSplitNaiveGate ||
+          (ASPSplitNaiveGateMax > 0 && (unsigned)MaxLT > ASPSplitNaiveGateMax)) {
+        ++NumNaiveGateSkipped;
+        return false;
+      }
+      ++NumNaiveGatePassed;
+    }
     for (MachineBasicBlock &MBB : MF)
       for (MachineInstr &MI : MBB) {
         if (MI.isDebugInstr() || MI.isPHI())
