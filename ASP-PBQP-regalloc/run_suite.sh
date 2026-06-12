@@ -37,10 +37,16 @@ if [ ${#BENCHES[@]} -eq 0 ]; then
            458.sjeng 433.milc 482.sphinx3 456.hmmer 445.gobmk 464.h264ref)
 fi
 
-CXXINC=(-isystem "$INC/c++/13.2.0" -isystem "$INC/c++/13.2.0/riscv64-unknown-elf")
-# -DSPEC_CPU_LINUX is the SPEC portability define for a Linux-style build; without
-# it several benchmarks (e.g. libquantum's config.h MAX_UNSIGNED) fail to compile.
-COMMON=(--target=$TARGET $MABI -isystem "$INC" -march=$MARCH $OPT -w -DSPEC_CPU -DSPEC_CPU_LINUX -DNDEBUG)
+# C++ benchmarks (namd, astar, ...) are pre-C++11; -std=gnu++98 lets them use the
+# 'register' keyword that newer C++ removes (a hard error otherwise).
+CXXINC=(-isystem "$INC/c++/13.2.0" -isystem "$INC/c++/13.2.0/riscv64-unknown-elf" -std=gnu++98)
+# -DSPEC_CPU_LINUX is the SPEC portability define for a Linux-style build (e.g.
+# libquantum's config.h MAX_UNSIGNED). The -Wno-* flags let modern clang accept
+# SPEC2006's pre-C11 C (implicit int/decls, void<->int) that it now rejects as
+# hard errors -- -w only covers warnings, not these promoted errors.
+COMMON=(--target=$TARGET $MABI -isystem "$INC" -march=$MARCH $OPT -w \
+        -DSPEC_CPU -DSPEC_CPU_LINUX -DNDEBUG \
+        -Wno-implicit-function-declaration -Wno-implicit-int -Wno-return-type -Wno-int-conversion)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -60,14 +66,22 @@ for B in "${BENCHES[@]}"; do
   SRC="$SPEC/$B/src"
   if [ ! -d "$SRC" ]; then log "$B: no src dir"; continue; fi
   log "begin $B"
+  # Per-benchmark portability defines (the real SPEC config sets these). milc's
+  # CPU2006 workload is the fat-link (asqtad) variant, so -DFN selects its *_fn
+  # sources (which reference the FN-gated 'fatlink' fields). milc still has
+  # mutually-exclusive variant files, so 100% file coverage is not expected.
+  EXTRA=()
+  case "$B" in
+    433.milc) EXTRA=(-DFN) ;;
+  esac
   INCDIRS=(); while IFS= read -r d; do INCDIRS+=(-I "$d"); done < <(find "$SRC" -type d)
   tb=0; ta=0; nok=0; ntot=0
   while IFS= read -r f; do
     ntot=$((ntot+1)); lang=()
     case "${f##*.}" in cpp|cc|C) lang=("${CXXINC[@]}");; esac
     ob="$WORK/b.o"; oa="$WORK/a.o"; rm -f "$ob" "$oa"
-    "$CLANG" "${COMMON[@]}" "${lang[@]}" "${INCDIRS[@]}" -c "$f" -o "$ob" 2>/dev/null
-    "$CLANG" "${COMMON[@]}" $ASPFLAGS "${lang[@]}" "${INCDIRS[@]}" -c "$f" -o "$oa" 2>/dev/null
+    "$CLANG" "${COMMON[@]}" "${EXTRA[@]}" "${lang[@]}" "${INCDIRS[@]}" -c "$f" -o "$ob" 2>/dev/null
+    "$CLANG" "${COMMON[@]}" "${EXTRA[@]}" $ASPFLAGS "${lang[@]}" "${INCDIRS[@]}" -c "$f" -o "$oa" 2>/dev/null
     [ -f "$ob" ] && [ -f "$oa" ] || { log "  skip file $(basename "$f") (compile failed)"; continue; }
     nok=$((nok+1))
     read cb bb <<<"$(count "$ob")"; tb=$((tb+bb))
