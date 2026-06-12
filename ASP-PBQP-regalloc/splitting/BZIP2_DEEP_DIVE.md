@@ -97,6 +97,34 @@ resumable-state-machine pattern (`handle_compress`, `BZ2_bzDecompress`), and
 the #2 gain (`ComputeNonbondedUtil.C`, a giant generated kernel) matches
 condition 1 and 3.
 
+## 5b. Ablation: is the gain ASP-computed coordination, or generic class-narrowing?
+
+Hypothesis tested: the constraints work because the solver selects a *jointly
+consistent* subset of candidates (coordination), which a blanket heuristic
+could not. Two arms, same files, same march/flags:
+`-riscv-asp-split-naive-gprc` (no solver; constrain EVERY compression-candidate
+vreg to GPRC) vs `-riscv-asp-split-constraints-only` (solver-selected
+constraints, no splits).
+
+| file | base | naive Δ (cons) | ASP-selected Δ (cons) |
+|---|---|---|---|
+| decompress.c | 9202 | **−1002** (838) | **−1002** (820) |
+| bzlib.c      | 7192 | −140 (610) | −144 (607) |
+| blocksort.c  | 5720 | +36 (297) | +34 (293) |
+| sjeng.c      | 7578 | +82 (136) | +86 (111) |
+
+**The hypothesis is refuted.** The no-solver arm reproduces the ASP arm to
+within ±4 B on every file, including the identical −1002 on decompress. The
+reason is visible in the constraint counts: the solver accepts nearly every
+candidate anyway (820 of 838 on decompress), so "selected" ≈ "all" — the
+selection carries almost no information. The churn-damping effect is real but
+it is **generic class-narrowing**, achievable by a ~50-line heuristic pass with
+no solver. Note also that neither arm discriminates the regime: both regress
+equally on blocksort/sjeng, so the solver does not even predict *where*
+narrowing helps; a separate regime gate (e.g. live-through count vs register
+file — the same quantity whose excess makes the windows pigeonhole-UNSAT) would
+be needed either way, and that quantity is directly computable without a solver.
+
 ## 6. Consequences
 
 * **All asp-split suite numbers measured before the gap-guard fix are suspect**

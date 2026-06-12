@@ -73,6 +73,7 @@ STATISTIC(NumReloadsInserted, "Spill reloads inserted by the ASP split pass");
 STATISTIC(NumWindowsNoModel, "Windows where no model was found (e.g. UNSAT)");
 STATISTIC(NumSplitsSkippedGap, "Value splits skipped: range crosses an "
                                "unsolved (no-model) window");
+STATISTIC(NumGPRCConstrained, "Vregs successfully constrained to GPRC");
 
 static cl::opt<bool> EnableASPSplit(
     "riscv-asp-split", cl::Hidden, cl::init(false),
@@ -94,6 +95,19 @@ static cl::opt<unsigned> ASPSplitWindowMin(
 static cl::opt<unsigned> ASPSplitMaxBlock(
     "riscv-asp-split-max-points", cl::Hidden, cl::init(2000),
     cl::desc("Skip basic blocks with more than this many points"));
+
+// Ablation modes for the "constraints as coordination" study.  The question:
+// is the win from the *jointly consistent selection* the solver makes, or
+// would any blanket class-narrowing perturb greedy equally well?
+static cl::opt<bool> ASPSplitNaiveGPRC(
+    "riscv-asp-split-naive-gprc", cl::Hidden, cl::init(false),
+    cl::desc("Ablation: skip the solver; constrain EVERY compression-candidate "
+             "vreg to GPRC (tests whether ASP's consistent selection matters)"));
+
+static cl::opt<bool> ASPSplitConstraintsOnly(
+    "riscv-asp-split-constraints-only", cl::Hidden, cl::init(false),
+    cl::desc("Apply only the GPRC class constraints from the solve; never "
+             "materialize live-range splits"));
 
 namespace {
 
@@ -730,8 +744,10 @@ bool RISCVASPSplit::applyActions(MachineFunction &MF, const RISCVSubtarget &ST) 
     }
   }
   for (Register V : GPRCWanted)
-    if (MRI.constrainRegClass(V, &RISCV::GPRCRegClass))
+    if (MRI.constrainRegClass(V, &RISCV::GPRCRegClass)) {
       Changed = true;
+      ++NumGPRCConstrained;
+    }
   return Changed;
 }
 
@@ -750,9 +766,27 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
   Plans.clear();
   GPRCWanted.clear();
   LLVM_DEBUG(dbgs() << "[asp-split] function " << MF.getName() << "\n");
+  if (ASPSplitNaiveGPRC) {
+    // Ablation arm: no solver.  Constrain every compression-candidate vreg to
+    // GPRC, including mutually-interfering sets the solver would have thinned.
+    (void)LIS;
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : MBB) {
+        if (MI.isDebugInstr() || MI.isPHI())
+          continue;
+        SmallVector<Register, 3> Need;
+        if (classify(MI, ST, Need))
+          for (Register R : Need)
+            if (R.isVirtual())
+              GPRCWanted.insert(R);
+      }
+    return applyActions(MF, ST);
+  }
   // Phase A: solve every block against the original liveness, recording actions.
   for (MachineBasicBlock &MBB : MF)
     solveBlock(MBB, LIS, MRI, ST);
+  if (ASPSplitConstraintsOnly)
+    Plans.clear(); // keep only the class constraints from the solve
   // Phase B: materialize them (mutates the MIR; liveness recomputed for RA).
   return applyActions(MF, ST);
 #else
