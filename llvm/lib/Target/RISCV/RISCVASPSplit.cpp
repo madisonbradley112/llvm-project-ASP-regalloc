@@ -63,6 +63,16 @@ STATISTIC(NumFuncs, "Functions processed by the ASP splitting pass");
 STATISTIC(NumBlocksSolved, "Basic blocks solved by the ASP splitting model");
 STATISTIC(NumValuesSplit, "Values the model chose to split (reg + memory)");
 STATISTIC(NumRealized, "Compression candidates realized (value in GPRC)");
+STATISTIC(NumWindowProbes, "Window solve calls (incl. binary-search probes)");
+STATISTIC(NumProbeOptimal, "Window solve calls that proved optimal in budget");
+STATISTIC(NumProbeTimeout, "Window solve calls that timed out (not proven)");
+STATISTIC(NumWindowsCommitted, "Windows committed into the allocation");
+STATISTIC(NumWindowsOptimal, "Committed windows that were proven optimal");
+STATISTIC(NumStoresInserted, "Spill stores inserted by the ASP split pass");
+STATISTIC(NumReloadsInserted, "Spill reloads inserted by the ASP split pass");
+STATISTIC(NumWindowsNoModel, "Windows where no model was found (e.g. UNSAT)");
+STATISTIC(NumSplitsSkippedGap, "Value splits skipped: range crosses an "
+                               "unsolved (no-model) window");
 
 static cl::opt<bool> EnableASPSplit(
     "riscv-asp-split", cl::Hidden, cl::init(false),
@@ -503,7 +513,13 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
       if (PV.first >= Lo && PV.first <= Hi)
         F << "cand(c" << (C++) << "," << PV.second << "," << PV.first << ").\n";
     std::string Program = std::string(kSplitModel) + F.str();
-    return runSplitSolve(Program, ASPSplitTimeLimit, Sol, Optimal);
+    bool Found = runSplitSolve(Program, ASPSplitTimeLimit, Sol, Optimal);
+    ++NumWindowProbes;
+    if (Found && Optimal)
+      ++NumProbeOptimal;
+    else if (Found)
+      ++NumProbeTimeout; // a model, but optimum not proven within the budget
+    return Found;
   };
 
   // Adaptive ("binary search") window sizing: from each position find the
@@ -512,6 +528,13 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
   // UPWARD (re-widen); else search DOWNWARD (narrow).  The Wmax ceiling makes
   // re-widening instant when pressure eases.  (Mirrors bisect_decompose.py.)
   unsigned Seed = Wmax;
+  // Points covered by a committed model.  A window can find NO model at all --
+  // notably when the block's live-through values (all pinned in registers by
+  // the block-local design) outnumber the register file, which is pigeonhole-
+  // UNSAT.  Such windows leave gaps in RegAt; a gap must never be interpreted
+  // as "the value was in memory" (that fabricates reloads from never-written
+  // slots), so values whose range touches a gap are excluded from splitting.
+  std::vector<bool> Covered(N, false);
   for (unsigned Lo = 0; Lo < N;) {
     unsigned Cap = std::min(Wmax, (unsigned)(N - Lo));
     unsigned S = std::max(Wmin, std::min(Seed, Cap));
@@ -543,12 +566,13 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
 
     unsigned ChosenW;
     std::vector<Loc> ChosenSol;
-    bool Found;
+    bool Found, ChosenOptimal = false;
     if (BestW != 0) { // got a proven-optimal window
       ChosenW = BestW;
       ChosenSol = std::move(BestSol);
       Found = true;
-    } else if (SeedFound && S == Wmin) { // seed already minimal
+      ChosenOptimal = true;
+    } else if (SeedFound && S == Wmin) { // seed already minimal (not optimal)
       ChosenW = S;
       ChosenSol = std::move(SeedSol);
       Found = true;
@@ -556,6 +580,12 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
       ChosenW = Wmin;
       bool O = false;
       Found = solveWin(Lo, Wmin, ChosenSol, O);
+      ChosenOptimal = O;
+    }
+    if (Found) {
+      ++NumWindowsCommitted;
+      if (ChosenOptimal)
+        ++NumWindowsOptimal;
     }
 
     unsigned Hi = std::min(Lo + ChosenW - 1, N - 1);
@@ -563,6 +593,10 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
       AnyWindowSolved = true;
       for (const Loc &L : ChosenSol)
         RegAt[{L.V, L.P}] = L.R;
+      for (unsigned P = Lo; P <= Hi; ++P)
+        Covered[P] = true;
+    } else {
+      ++NumWindowsNoModel;
     }
     ExitReg.clear();
     for (unsigned Id = 0; Id < IdToV.size(); ++Id) {
@@ -590,6 +624,19 @@ void RISCVASPSplit::solveBlock(MachineBasicBlock &MBB, LiveIntervals &LIS,
     if (LiveOut[Id])
       continue; // never split (see pin emission)
     auto &LR = LiveRange[Id];
+    // Correctness guard: only split values whose whole live range was covered
+    // by committed models.  A gap (no-model window) carries no location data --
+    // treating it as "in memory" would emit reloads with no matching store.
+    bool RangeCovered = true;
+    for (int P = LR.first; P <= LR.second; ++P)
+      if (!Covered[(unsigned)P]) {
+        RangeCovered = false;
+        break;
+      }
+    if (!RangeCovered) {
+      ++NumSplitsSkippedGap;
+      continue;
+    }
     VSplit VS;
     VS.V = IdToV[Id];
     for (int P = LR.first + 1; P <= LR.second; ++P) {
@@ -667,10 +714,13 @@ bool RISCVASPSplit::applyActions(MachineFunction &MF, const RISCVSubtarget &ST) 
           Register NV = MRI.createVirtualRegister(RC);
           TII->loadRegFromStackSlot(MBB, It, NV, FI, RC, TRI, NV);
           Cur = NV;
+          ++NumReloadsInserted;
         }
-        if (StoreAt.count(P))
+        if (StoreAt.count(P)) {
           TII->storeRegToStackSlot(MBB, It, Cur, /*isKill=*/false, FI, RC, TRI,
                                    Cur);
+          ++NumStoresInserted;
+        }
         if (Cur != VS.V)
           for (MachineOperand &MO : MI->operands())
             if (MO.isReg() && MO.getReg() == VS.V)
