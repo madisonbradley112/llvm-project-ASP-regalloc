@@ -131,6 +131,14 @@ static cl::opt<unsigned> ASPSplitNaiveGateMax(
     cl::desc("Naive mode: skip functions whose max live-at-entry GPR vreg "
              "count exceeds this (0 = no upper bound)"));
 
+// Per-function profitability study: emit a statically-computable feature vector
+// for every function ("[asp-feat] name | k=v ...") so an external harness can
+// correlate features against the oracle (per-function dText with narrowing
+// on vs off).  Does not change codegen by itself.
+static cl::opt<bool> ASPSplitDumpFeatures(
+    "riscv-asp-split-dump-features", cl::Hidden, cl::init(false),
+    cl::desc("Emit a per-function feature vector for the profitability study"));
+
 namespace {
 
 // Per-program-point splitting model (mirrors regalloc_region.lp).  Dynamic
@@ -310,6 +318,9 @@ private:
                   MachineRegisterInfo &MRI, const RISCVSubtarget &ST);
   // Apply all recorded actions to the MIR; returns true if anything changed.
   bool applyActions(MachineFunction &MF, const RISCVSubtarget &ST);
+  // Max over blocks of GPR vregs live at block entry (the contention metric).
+  int maxLiveAtEntry(MachineFunction &MF, LiveIntervals &LIS,
+                     MachineRegisterInfo &MRI) const;
 #endif
 };
 
@@ -773,6 +784,36 @@ bool RISCVASPSplit::applyActions(MachineFunction &MF, const RISCVSubtarget &ST) 
   return Changed;
 }
 
+// Max over blocks of GPR vregs live at block entry, via a diff-array over the
+// (layout-ordered) block start indices.  This is the contention metric the
+// gate keys on; also exported as a feature.
+int RISCVASPSplit::maxLiveAtEntry(MachineFunction &MF, LiveIntervals &LIS,
+                                  MachineRegisterInfo &MRI) const {
+  SlotIndexes *SI = LIS.getSlotIndexes();
+  SmallVector<SlotIndex, 64> Starts;
+  for (MachineBasicBlock &MBB : MF)
+    Starts.push_back(SI->getMBBStartIdx(&MBB));
+  std::vector<int> Diff(Starts.size() + 1, 0);
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (MRI.reg_nodbg_empty(R) || !LIS.hasInterval(R) ||
+        !MRI.getRegClass(R)->contains(RISCV::X10))
+      continue;
+    for (const auto &Seg : LIS.getInterval(R)) {
+      auto Lo = llvm::lower_bound(Starts, Seg.start);
+      auto Hi = llvm::lower_bound(Starts, Seg.end);
+      ++Diff[Lo - Starts.begin()];
+      --Diff[Hi - Starts.begin()];
+    }
+  }
+  int Cur = 0, MaxLT = 0;
+  for (size_t I = 0; I < Starts.size(); ++I) {
+    Cur += Diff[I];
+    MaxLT = std::max(MaxLT, Cur);
+  }
+  return MaxLT;
+}
+
 #endif // LLVM_PBQP_HAVE_CLINGO
 
 bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
@@ -788,34 +829,39 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
   Plans.clear();
   GPRCWanted.clear();
   LLVM_DEBUG(dbgs() << "[asp-split] function " << MF.getName() << "\n");
+
+  if (ASPSplitDumpFeatures) {
+    // Statically-computable per-function features for the profitability study.
+    unsigned Pts = 0, Calls = 0, Cands = 0, CandRefs = 0;
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : MBB) {
+        if (MI.isDebugInstr() || MI.isPHI())
+          continue;
+        ++Pts;
+        if (MI.isCall())
+          ++Calls;
+        SmallVector<Register, 3> Need;
+        if (classify(MI, ST, Need)) {
+          ++Cands;
+          for (Register R : Need)
+            if (R.isVirtual())
+              ++CandRefs;
+        }
+      }
+    unsigned NumBlocks = 0;
+    for (MachineBasicBlock &MBB : MF)
+      (void)MBB, ++NumBlocks;
+    errs() << "[asp-feat] " << MF.getName() << " | maxlt="
+           << maxLiveAtEntry(MF, LIS, MRI) << " pts=" << Pts
+           << " calls=" << Calls << " cands=" << Cands << " candrefs="
+           << CandRefs << " blocks=" << NumBlocks << "\n";
+  }
+
   if (ASPSplitNaiveGPRC) {
     // No solver.  Constrain every compression-candidate vreg to GPRC,
     // optionally gated to functions where greedy will actually churn.
     if (ASPSplitNaiveGate > 0 || ASPSplitNaiveGateMax > 0) {
-      // Max over blocks of GPR vregs live at block entry, via a diff-array
-      // over the (layout-ordered, ascending) block start indices.
-      SlotIndexes *SI = LIS.getSlotIndexes();
-      SmallVector<SlotIndex, 64> Starts;
-      for (MachineBasicBlock &MBB : MF)
-        Starts.push_back(SI->getMBBStartIdx(&MBB));
-      std::vector<int> Diff(Starts.size() + 1, 0);
-      for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
-        Register R = Register::index2VirtReg(I);
-        if (MRI.reg_nodbg_empty(R) || !LIS.hasInterval(R) ||
-            !MRI.getRegClass(R)->contains(RISCV::X10))
-          continue;
-        for (const auto &Seg : LIS.getInterval(R)) {
-          auto Lo = llvm::lower_bound(Starts, Seg.start);
-          auto Hi = llvm::lower_bound(Starts, Seg.end);
-          ++Diff[Lo - Starts.begin()];
-          --Diff[Hi - Starts.begin()];
-        }
-      }
-      int Cur = 0, MaxLT = 0;
-      for (size_t I = 0; I < Starts.size(); ++I) {
-        Cur += Diff[I];
-        MaxLT = std::max(MaxLT, Cur);
-      }
+      int MaxLT = maxLiveAtEntry(MF, LIS, MRI);
       LLVM_DEBUG(dbgs() << "[asp-split-naive] " << MF.getName()
                         << " maxLiveAtEntry=" << MaxLT << " gate="
                         << ASPSplitNaiveGate << ":" << ASPSplitNaiveGateMax
