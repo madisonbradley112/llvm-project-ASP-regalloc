@@ -28,7 +28,7 @@ BENCHES=("$@")
 # column (avoids gawk-only strtonum -- macOS ships BSD awk).
 syms(){ "$NM" --print-size --defined-only --radix=d "$1" 2>/dev/null | awk '$3=="t"||$3=="T"{print $4, $2+0}'; }
 
-echo "bench,func,base_bytes,delta_bytes,maxlt,pts,calls,cands,candrefs,blocks"
+echo "bench,func,base_bytes,delta_bytes,maxlt,pts,calls,cands,candrefs,blocks,ncand,xcall,spanblk,clivelen"
 for B in "${BENCHES[@]}"; do
   SRC="$SPEC/$B/src"; [ -d "$SRC" ] || continue
   EXTRA=(); [ "$B" = "433.milc" ] && EXTRA=(-DFN)
@@ -46,13 +46,13 @@ for B in "${BENCHES[@]}"; do
     join "$WORK/bs.txt" "$WORK/ns.txt" > "$WORK/sz.txt"   # name base narr
     # features keyed by func (from the narrowed compile's stderr)
     awk '/^\[asp-feat\]/{f=$2; for(i=4;i<=NF;i++){split($i,kv,"="); F[f"_"kv[1]]=kv[2]} fn[f]=1}
-         END{for(k in fn) print k, F[k"_maxlt"], F[k"_pts"], F[k"_calls"], F[k"_cands"], F[k"_candrefs"], F[k"_blocks"]}' "$feat" > "$WORK/ft.txt"
+         END{for(k in fn) print k, F[k"_maxlt"], F[k"_pts"], F[k"_calls"], F[k"_cands"], F[k"_candrefs"], F[k"_blocks"], F[k"_ncand"], F[k"_xcall"], F[k"_spanblk"], F[k"_clivelen"]}' "$feat" > "$WORK/ft.txt"
     # merge sizes + features (NR==FNR: first file=sizes, second=features)
     awk -v bench="$B" '
       NR==FNR { base[$1]=$2; narr[$1]=$3; next }
-      ($1 in base) && NF>=7 {
-        printf "%s,%s,%d,%d,%s,%s,%s,%s,%s,%s\n",
-               bench, $1, base[$1], narr[$1]-base[$1], $2, $3, $4, $5, $6, $7
+      ($1 in base) && NF>=11 {
+        printf "%s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+               bench, $1, base[$1], narr[$1]-base[$1], $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
       }
     ' "$WORK/sz.txt" "$WORK/ft.txt"
   done < <(find "$SRC" \( -name '*.c' -o -name '*.cpp' -o -name '*.cc' -o -name '*.C' \))

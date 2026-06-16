@@ -1,0 +1,10 @@
+  PID TTY           TIME CMD
+ 1252 ttys001    0:00.44 /bin/zsh
+ 1266 ttys001    0:00.00 /bin/zsh
+ 1385 ttys001    0:00.00 /bin/zsh
+ 1386 ttys001    0:00.00 /bin/zsh
+ 1388 ttys001    0:24.95 /Users/jupiterbradley/.cache/gitstatus/gitstatusd-darwin-arm64 -G v1.5.4 -s -1 -u -1 -d -1 -c -1 -m -1 -v FATAL -t 32
+ 1431 ttys001    0:00.02 bash ASP-PBQP-regalloc/run_suite.sh
+ 1536 ttys001    0:16.61 /Users/jupiterbradley/Documents/University/msc-thesis/clingo-regalloc/llvm-project-ASP-regalloc/build/bin/clang --target=riscv32-unknown-elf -mabi=ilp32e -isystem /opt/homebrew/Cellar/riscv-gnu-toolchain/main/riscv64-unknown-elf/include -march=rv32e_zca_zcb_zcmp -Os -w -DSPEC_CPU -DSPEC_CPU_LINUX -DNDEBUG -mllvm -riscv-asp-split -mllvm -riscv-asp-split-time-limit=1 -mllvm -riscv-asp-split-max-points=300 -I /Users/jupiterbradley/Virtual Machines.localized/ubuntu-shared-folder/reimplementing-compression-aware-register-allocator/app/cpu2006/benchspec/CPU2006/401.bzip2/src -c /Users/jupiterbradley/Virtual Machines.localized/ubuntu-shared-folder/reimplementing-compression-aware-register-allocator/app/cpu2006/benchspec/CPU2006/401.bzip2/src/compress.c -o /var/folders/br/wc31thcd4q36c066bsh8vjbc0000gn/T/tmp.vrnEetaWgF/a.o
+ 1559 ttys001    0:00.01 bash ASP-PBQP-regalloc/run_suite.sh
+ 1579 ttys001    0:04.90 /Users/jupiterbradley/Documents/University/msc-thesis/clingo-regalloc/llvm-project-ASP-regalloc/build/bin/clang --target=riscv32-unknown-elf -mabi=ilp32e -isystem /opt/homebrew/Cellar/riscv-gnu-toolchain/main/riscv64-unknown-elf/include -march=rv32e_zca_zcb_zcmp -Os -w -DSPEC_CPU -DSPEC_CPU_LINUX -DNDEBUG -mllvm -riscv-asp-split -mllvm -riscv-asp-split-time-limit=1 -mllvm -riscv-asp-split-max-points=300 -I /Users/jupiterbradley/Virtual Machines.localized/ubuntu-shared-folder/reimplementing-compression-aware-register-allocator/app/cpu2006/benchspec/CPU2006/462.libquantum/src -c /Users/jupiterbradley/Virtual Machines.localized/ubuntu-shared-folder/reimplementing-compression-aware-register-allocator/app/cpu2006/benchspec/CPU2006/462.libquantum/src/oaddn.c -o /var/folders/br/wc31thcd4q36c066bsh8vjbc0000gn/T/tmp.lRmeCCqVJt/a.o

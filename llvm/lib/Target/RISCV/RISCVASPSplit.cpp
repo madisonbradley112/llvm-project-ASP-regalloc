@@ -30,6 +30,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -40,7 +41,9 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
 #ifdef LLVM_PBQP_HAVE_CLINGO
@@ -76,6 +79,7 @@ STATISTIC(NumSplitsSkippedGap, "Value splits skipped: range crosses an "
 STATISTIC(NumGPRCConstrained, "Vregs successfully constrained to GPRC");
 STATISTIC(NumNaiveGatePassed, "Functions passing the naive thrash gate");
 STATISTIC(NumNaiveGateSkipped, "Functions skipped by the naive thrash gate");
+STATISTIC(NumXCallSkipped, "Candidate vregs not narrowed: live range crosses a call");
 
 static cl::opt<bool> EnableASPSplit(
     "riscv-asp-split", cl::Hidden, cl::init(false),
@@ -138,6 +142,36 @@ static cl::opt<unsigned> ASPSplitNaiveGateMax(
 static cl::opt<bool> ASPSplitDumpFeatures(
     "riscv-asp-split-dump-features", cl::Hidden, cl::init(false),
     cl::desc("Emit a per-function feature vector for the profitability study"));
+
+// Per-candidate narrowing: in naive mode, do NOT constrain a candidate vreg
+// whose live range crosses a call.  In ilp32e x8-x15 are caller-saved, so a
+// narrowed cross-call value forces save/restore churn -- the regression driver
+// the profitability study identified.  Moves the narrow/skip decision from
+// per-function to per-value, the granularity where the win/lose split lives.
+static cl::opt<bool> ASPSplitSkipXCall(
+    "riscv-asp-split-skip-xcall", cl::Hidden, cl::init(false),
+    cl::desc("Naive mode: skip candidate vregs whose live range crosses a call "
+             "(per-candidate narrowing)"));
+
+// Soft cross-call skipping: only drop a candidate whose range crosses at least
+// this many calls.  "crosses any call" (=1) is too blunt -- a value spanning a
+// single call near a function edge is often still profitable to narrow, while
+// one threaded through many calls is the real save/restore liability.  Lets the
+// autotuner trial several sparsity thresholds as distinct policies.
+static cl::opt<unsigned> ASPSplitXCallThreshold(
+    "riscv-asp-split-xcall-threshold", cl::Hidden, cl::init(1),
+    cl::desc("Naive skip-xcall mode: skip a candidate only if its live range "
+             "crosses at least this many calls (default 1 = any call)"));
+
+// Autotuner: a per-function policy map.  Each line is "<funcname> <policy>"
+// where policy is none|all|skip.  The autotuner measures every function under
+// each policy, picks the smallest, writes this map, then recompiles once so a
+// single correct object embeds the best-of-N choice per function.  Functions
+// absent from the map use 'none' (no narrowing).
+static cl::opt<std::string> ASPSplitPolicyFile(
+    "riscv-asp-split-policy-file", cl::Hidden, cl::init(""),
+    cl::desc("Autotuner: per-function narrowing policy map (lines: name "
+             "none|all|skip)"));
 
 namespace {
 
@@ -307,6 +341,15 @@ private:
   };
   std::vector<BlockPlan> Plans;
   DenseSet<Register> GPRCWanted; // values to constrain to GPRC (compression)
+
+  // Autotuner policy map (lazily loaded from -riscv-asp-split-policy-file).
+  // Encoded value: 0 = none (no narrowing); 1 = all (constrain every
+  // candidate); >=2 = skip-xcall with cross-call threshold (value-1), i.e.
+  // 2 = "skip" (threshold 1), 3 = "skip2", 4 = "skip3", ...
+  enum Policy { PolNone = 0, PolAll = 1, PolSkipBase = 2 };
+  StringMap<int> PolicyMap;
+  bool PolicyLoaded = false;
+  void loadPolicyFile();
 
   // Detect whether MI has an RVC-compressible form gated on some of its GPR
   // operands being in GPRC; append those vreg operands to Need.  Mirrors the
@@ -816,6 +859,50 @@ int RISCVASPSplit::maxLiveAtEntry(MachineFunction &MF, LiveIntervals &LIS,
 
 #endif // LLVM_PBQP_HAVE_CLINGO
 
+// Parse the autotuner policy map once.  Lines are "<funcname> <none|all|skip>";
+// blank lines and '#' comments are ignored.  A malformed/missing file leaves
+// the map empty (every function defaults to 'none').
+void RISCVASPSplit::loadPolicyFile() {
+  if (PolicyLoaded)
+    return;
+  PolicyLoaded = true;
+  auto BufOrErr = MemoryBuffer::getFile(ASPSplitPolicyFile);
+  if (!BufOrErr) {
+    errs() << "[asp-split] warning: cannot open policy file '"
+           << ASPSplitPolicyFile << "'\n";
+    return;
+  }
+  for (line_iterator LI(**BufOrErr, /*SkipBlanks=*/true, '#'); !LI.is_at_eof();
+       ++LI) {
+    StringRef Line = LI->trim();
+    if (Line.empty())
+      continue;
+    StringRef Name, Pol;
+    std::tie(Name, Pol) = Line.split(' ');
+    Name = Name.trim();
+    Pol = Pol.trim();
+    int P = PolNone;
+    if (Pol == "all") {
+      P = PolAll;
+    } else if (Pol == "none") {
+      P = PolNone;
+    } else if (Pol.starts_with("skip")) {
+      // "skip" => threshold 1; "skipN" => threshold N.
+      unsigned Thr = 1;
+      StringRef Rest = Pol.drop_front(4);
+      if (!Rest.empty() && Rest.getAsInteger(10, Thr))
+        continue; // malformed "skip<garbage>"
+      if (Thr < 1)
+        Thr = 1;
+      P = PolSkipBase + (int)(Thr - 1);
+    } else {
+      continue; // unknown policy token -> ignore line
+    }
+    if (!Name.empty())
+      PolicyMap[Name] = P;
+  }
+}
+
 bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
   if (!EnableASPSplit)
     return false;
@@ -833,31 +920,88 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
   if (ASPSplitDumpFeatures) {
     // Statically-computable per-function features for the profitability study.
     unsigned Pts = 0, Calls = 0, Cands = 0, CandRefs = 0;
+    SlotIndexes *SIdx = LIS.getSlotIndexes();
+    SmallVector<SlotIndex, 16> CallSlots;
+    DenseSet<Register> CandVRegs;     // distinct candidate vregs
     for (MachineBasicBlock &MBB : MF)
       for (MachineInstr &MI : MBB) {
         if (MI.isDebugInstr() || MI.isPHI())
           continue;
         ++Pts;
-        if (MI.isCall())
+        if (MI.isCall()) {
           ++Calls;
+          CallSlots.push_back(SIdx->getInstructionIndex(MI).getRegSlot());
+        }
         SmallVector<Register, 3> Need;
         if (classify(MI, ST, Need)) {
           ++Cands;
           for (Register R : Need)
-            if (R.isVirtual())
+            if (R.isVirtual()) {
               ++CandRefs;
+              CandVRegs.insert(R);
+            }
         }
       }
+    // Per-candidate-value features: the narrowing decision is really per value,
+    // so aggregate over the distinct candidate vregs.  xcall = lives across a
+    // call (caller-saved x8-x15 -> save/restore churn, the regression driver);
+    // spanblk = lives across a block boundary (where greedy splits); clivelen =
+    // total live length in slot units (long ranges amortise compressed forms).
+    unsigned XCall = 0, SpanBlk = 0;
+    uint64_t CLiveLen = 0;
+    for (Register R : CandVRegs) {
+      if (!LIS.hasInterval(R))
+        continue;
+      const LiveInterval &LI = LIS.getInterval(R);
+      bool Crosses = false;
+      for (SlotIndex CS : CallSlots)
+        if (LI.liveAt(CS)) { Crosses = true; break; }
+      if (Crosses)
+        ++XCall;
+      MachineBasicBlock *FirstMBB = nullptr;
+      bool Spans = false;
+      for (const auto &Seg : LI) {
+        CLiveLen += Seg.start.distance(Seg.end);
+        MachineBasicBlock *A = SIdx->getMBBFromIndex(Seg.start);
+        MachineBasicBlock *B = SIdx->getMBBFromIndex(Seg.end.getPrevSlot());
+        if (!FirstMBB)
+          FirstMBB = A;
+        if (A != FirstMBB || B != FirstMBB)
+          Spans = true;
+      }
+      if (Spans)
+        ++SpanBlk;
+    }
     unsigned NumBlocks = 0;
     for (MachineBasicBlock &MBB : MF)
       (void)MBB, ++NumBlocks;
     errs() << "[asp-feat] " << MF.getName() << " | maxlt="
            << maxLiveAtEntry(MF, LIS, MRI) << " pts=" << Pts
            << " calls=" << Calls << " cands=" << Cands << " candrefs="
-           << CandRefs << " blocks=" << NumBlocks << "\n";
+           << CandRefs << " blocks=" << NumBlocks << " ncand=" << CandVRegs.size()
+           << " xcall=" << XCall << " spanblk=" << SpanBlk
+           << " clivelen=" << CLiveLen << "\n";
   }
 
-  if (ASPSplitNaiveGPRC) {
+  // Effective per-function narrowing policy.  The naive command-line flags set
+  // a default; the autotuner policy map (if supplied) overrides it per function
+  // so one recompile embeds the best-of-N choice.
+  bool DoNarrow = ASPSplitNaiveGPRC;
+  bool DoSkipXCall = ASPSplitSkipXCall;
+  unsigned XCallThr = ASPSplitXCallThreshold;
+  if (!ASPSplitPolicyFile.empty()) {
+    loadPolicyFile();
+    int Pol = PolNone;
+    auto It = PolicyMap.find(MF.getName());
+    if (It != PolicyMap.end())
+      Pol = It->second;
+    DoNarrow = (Pol != PolNone);
+    DoSkipXCall = (Pol >= PolSkipBase);
+    if (DoSkipXCall)
+      XCallThr = (unsigned)(Pol - PolSkipBase + 1); // PolSkipBase -> threshold 1
+  }
+
+  if (DoNarrow) {
     // No solver.  Constrain every compression-candidate vreg to GPRC,
     // optionally gated to functions where greedy will actually churn.
     if (ASPSplitNaiveGate > 0 || ASPSplitNaiveGateMax > 0) {
@@ -873,6 +1017,26 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
       }
       ++NumNaiveGatePassed;
     }
+    // Per-candidate narrowing: collect call slots so we can drop any candidate
+    // whose live range crosses a call (caller-saved x8-x15 -> save/restore).
+    SmallVector<SlotIndex, 16> CallSlots;
+    if (DoSkipXCall) {
+      SlotIndexes *SIdx = LIS.getSlotIndexes();
+      for (MachineBasicBlock &MBB : MF)
+        for (MachineInstr &MI : MBB)
+          if (MI.isCall())
+            CallSlots.push_back(SIdx->getInstructionIndex(MI).getRegSlot());
+    }
+    auto crossesCall = [&](Register R) {
+      if (!LIS.hasInterval(R))
+        return false;
+      const LiveInterval &LI = LIS.getInterval(R);
+      unsigned N = 0;
+      for (SlotIndex CS : CallSlots)
+        if (LI.liveAt(CS) && ++N >= XCallThr)
+          return true;
+      return false;
+    };
     for (MachineBasicBlock &MBB : MF)
       for (MachineInstr &MI : MBB) {
         if (MI.isDebugInstr() || MI.isPHI())
@@ -880,11 +1044,20 @@ bool RISCVASPSplit::runOnMachineFunction(MachineFunction &MF) {
         SmallVector<Register, 3> Need;
         if (classify(MI, ST, Need))
           for (Register R : Need)
-            if (R.isVirtual())
+            if (R.isVirtual()) {
+              if (DoSkipXCall && crossesCall(R)) {
+                ++NumXCallSkipped;
+                continue;
+              }
               GPRCWanted.insert(R);
+            }
       }
     return applyActions(MF, ST);
   }
+  // Autotuner 'none' (or naive mode with this function not narrowed): leave the
+  // function to plain greedy.  Never fall through to the solver in these modes.
+  if (!ASPSplitPolicyFile.empty() || ASPSplitNaiveGPRC)
+    return false;
   // Phase A: solve every block against the original liveness, recording actions.
   for (MachineBasicBlock &MBB : MF)
     solveBlock(MBB, LIS, MRI, ST);

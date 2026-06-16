@@ -1,0 +1,21 @@
+Mon Jun 15 17:56:04 MDT 2026
+Running ./configure with arguments:
+
+This file contains information that is captured from running the configure
+script.  Lines that begin with a "+" are command lines echoed by the
+shell.  Other lines are the output of commands; usually the contents of
+test case files or the output from compilers.  If configure does the
+wrong thing, you can use the information captured here to aid in debugging.
+
+++ . ./config.site
++++ DSO=no
++++ JPEG=no
++++ HTML=no
++++ DIR_BIN=bin
++++ DIR_LIB=lib
++++ DIR_INC=include
++++ DIR_MAN=man
++++ DIR_HTML=httpd/htdocs/tiff
++++ FILLORDER=MSB2LSB
++++ AR=ar
++++ CC=gcc

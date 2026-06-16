@@ -1,0 +1,21 @@
+This file contains any messages produced by compilers while
+running configure, to aid debugging if configure makes a mistake.
+
+configure:568: checking for a BSD compatible install
+configure:621: checking whether build environment is sane
+configure:678: checking whether make sets ${MAKE}
+configure:724: checking for working aclocal
+configure:737: checking for working autoconf
+configure:750: checking for working automake
+configure:763: checking for working autoheader
+configure:776: checking for working makeinfo
+configure:798: checking for gcc
+configure:911: checking whether the C compiler (/Users/jupiterbradley/llvm//bin/clang -g -O2 -Wall -L/Users/jupiterbradley/llvm//lib) works
+configure:927: /Users/jupiterbradley/llvm//bin/clang -o conftest -g -O2 -Wall -I/Users/jupiterbradley/llvm//include -L/Users/jupiterbradley/llvm//lib conftest.c  1>&5
+./configure: line 926: /Users/jupiterbradley/llvm//bin/clang: No such file or directory
+configure: failed program was:
+
+#line 922 "configure"
+#include "confdefs.h"
+
+main(){return(0);}
