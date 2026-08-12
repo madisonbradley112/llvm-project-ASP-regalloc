@@ -117,6 +117,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVDeadRegisterDefinitionsPass(*PR);
   initializeRISCVLateBranchOptPass(*PR);
   initializeRISCVMakeCompressibleOptPass(*PR);
+  initializeRISCVMakeCompressibleRegisterSwapPass(*PR);
+  initializeRISCVCompressibleSwapVerifyPass(*PR);
   initializeRISCVGatherScatterLoweringPass(*PR);
   initializeRISCVCodeGenPreparePass(*PR);
   initializeRISCVPostRAExpandPseudoPass(*PR);
@@ -395,6 +397,7 @@ public:
   bool addRegAssignAndRewriteFast() override;
   bool addRegAssignAndRewriteOptimized() override;
   void addPreRegAlloc() override;
+  void addPostRewrite() override;
   void addPostRegAlloc() override;
   void addFastRegAlloc() override;
   bool addILPOpts() override;
@@ -603,6 +606,16 @@ void RISCVPassConfig::addPreRegAlloc() {
     addPass(&MachinePipelinerID);
 
   addPass(createRISCVVMV0EliminationPass());
+
+  // Compression-aware live range splitting at call boundaries. It needs
+  // LiveIntervals, so it cannot run here directly -- this hook is before
+  // PHIElimination and LiveIntervals cannot be computed over MIR that still
+  // has PHIs. Schedule it just after the register coalescer instead, where
+  // PHIs are gone, LiveIntervals is live and maintained, and the COPY it
+  // inserts will not simply be coalesced back away.
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    insertPass(&RegisterCoalescerID,
+               createRISCVMakeCompressibleRegisterSwapPass());
 }
 
 void RISCVPassConfig::addFastRegAlloc() {
@@ -610,6 +623,14 @@ void RISCVPassConfig::addFastRegAlloc() {
   TargetPassConfig::addFastRegAlloc();
 }
 
+
+void RISCVPassConfig::addPostRewrite() {
+  // Real registers are known here and copy propagation has not run yet, which
+  // is exactly the window in which a call-boundary split can be checked and,
+  // if it did not pay for itself, handed back to copy propagation to remove.
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    addPass(createRISCVCompressibleSwapVerifyPass());
+}
 
 void RISCVPassConfig::addPostRegAlloc() {
   if (TM->getOptLevel() != CodeGenOptLevel::None &&

@@ -46,6 +46,12 @@ void initializeRISCVLateBranchOptPass(PassRegistry &);
 FunctionPass *createRISCVMakeCompressibleOptPass();
 void initializeRISCVMakeCompressibleOptPass(PassRegistry &);
 
+FunctionPass *createRISCVMakeCompressibleRegisterSwapPass();
+void initializeRISCVMakeCompressibleRegisterSwapPass(PassRegistry &);
+
+FunctionPass *createRISCVCompressibleSwapVerifyPass();
+void initializeRISCVCompressibleSwapVerifyPass(PassRegistry &);
+
 FunctionPass *createRISCVGatherScatterLoweringPass();
 void initializeRISCVGatherScatterLoweringPass(PassRegistry &);
 

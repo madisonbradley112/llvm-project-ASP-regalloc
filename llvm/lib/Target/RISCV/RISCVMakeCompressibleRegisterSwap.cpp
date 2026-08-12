@@ -142,6 +142,7 @@ char RISCVMakeCompressibleRegisterSwap::ID = 0;
 
 INITIALIZE_PASS_BEGIN(RISCVMakeCompressibleRegisterSwap, DEBUG_TYPE, PASS_NAME,
                       false, false)
+INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
@@ -150,6 +151,14 @@ INITIALIZE_PASS_END(RISCVMakeCompressibleRegisterSwap, DEBUG_TYPE, PASS_NAME,
 
 void RISCVMakeCompressibleRegisterSwap::getAnalysisUsage(
     AnalysisUsage &AU) const {
+  // The pass rewrites operands and inserts copies; it never touches the CFG.
+  AU.setPreservesCFG();
+  // SlotIndexes must be named explicitly. LiveIntervals requires it
+  // transitively and holds a reference to it, so preserving LiveIntervals
+  // without preserving the indexes it is built on leaves every later consumer
+  // (the machine scheduler, the allocator) reading a stale index.
+  AU.addRequired<SlotIndexesWrapperPass>();
+  AU.addPreserved<SlotIndexesWrapperPass>();
   AU.addRequired<LiveIntervalsWrapperPass>();
   AU.addPreserved<LiveIntervalsWrapperPass>();
   AU.addRequired<MachineDominatorTreeWrapperPass>();
@@ -206,23 +215,24 @@ bool RISCVMakeCompressibleRegisterSwap::mayBeGPRC(Register R) const {
   return RISCV::GPRCRegClass.contains(R);
 }
 
-/// Would \p MI encode in 16 bits if the register operand at \p OpNo were in
-/// GPRC, holding the opcode, immediate and operand structure fixed?
+/// Would \p MI encode in 16 bits, holding the opcode, immediate and operand
+/// structure fixed, given \p OperandOk to answer whether the register operand
+/// at a given index is in GPRC?
 ///
 /// Mirrors the CompressPat records in RISCVInstrInfoC.td. Each pattern encodes
 /// three constraints at once: register class, immediate predicate, and (via
 /// repeated operand names) the two-address requirement.
-bool RISCVMakeCompressibleRegisterSwap::wouldCompressIfGPRC(
-    const MachineInstr &MI, unsigned OpNo) const {
-  const bool IsRV64 = STI->is64Bit();
-
+///
+/// The OperandOk indirection is what lets one table serve two very different
+/// questions. Before allocation it is a guess about where a virtual register
+/// might land; afterwards it is a fact about where a physical register did.
+static bool wouldCompress(const MachineInstr &MI, bool IsRV64,
+                          function_ref<bool(unsigned)> OperandOk) {
   auto reg = [&](unsigned N) -> Register {
     const MachineOperand &MO = MI.getOperand(N);
     return MO.isReg() ? MO.getReg() : Register();
   };
-  // Every *other* register the compressed form needs in GPRC must plausibly
-  // get there; the one we were asked about is the one we are going to fix.
-  auto otherOk = [&](unsigned N) { return N == OpNo || mayBeGPRC(reg(N)); };
+  auto otherOk = [&](unsigned N) { return OperandOk(N); };
 
   switch (MI.getOpcode()) {
   default:
@@ -297,6 +307,18 @@ bool RISCVMakeCompressibleRegisterSwap::wouldCompressIfGPRC(
   // until BranchRelaxation, so including them adds a class of estimation error
   // for a small share of the population.
   }
+}
+
+/// Pre-RA estimate: assume the operand at \p OpNo is the one being moved into
+/// GPRC, and be optimistic about the rest.
+bool RISCVMakeCompressibleRegisterSwap::wouldCompressIfGPRC(
+    const MachineInstr &MI, unsigned OpNo) const {
+  return wouldCompress(MI, STI->is64Bit(), [&](unsigned N) {
+    if (N == OpNo)
+      return true;
+    const MachineOperand &MO = MI.getOperand(N);
+    return MO.isReg() && mayBeGPRC(MO.getReg());
+  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -387,7 +409,12 @@ bool RISCVMakeCompressibleRegisterSwap::buildCandidate(
     if (!wouldCompressIfGPRC(*UseMI, MO.getOperandNo()))
       continue;
 
-    SlotIndex UseIdx = LIS->getInstructionIndex(*UseMI).getRegSlot();
+    // Query at the use slot, not the register (def) slot. A live range that
+    // dies at its last user ends *at* that user's RegSlot, and segments are
+    // half-open, so asking there returns null and would silently drop the
+    // final use of every candidate. This is the same slot the split point
+    // above is computed with.
+    SlotIndex UseIdx = LIS->getInstructionIndex(*UseMI).getBaseIndex();
     if (CallLimit.isValid() && UseIdx >= CallLimit) {
       ++NumRejectedCall;
       continue;
@@ -463,6 +490,13 @@ bool RISCVMakeCompressibleRegisterSwap::performSplit(SplitCandidate &C) {
                                TII->get(TargetOpcode::COPY), New)
                            .addReg(C.Reg);
 
+  // Post-RA this copy is pure dataflow redundancy: the parent still holds the
+  // value at every rewritten use. Copy propagation would therefore forward
+  // through it and delete it, undoing the split entirely -- it has no way to
+  // see that the whole point was the destination's register class. Mark it so
+  // it survives.
+  Copy->setFlag(MachineInstr::NoCopyProp);
+
   // Guard: with -riscv-swap-stop-at-next-call=false, candidates from the same
   // parent can overlap, and an earlier split may already have rewritten this
   // operand. Re-check rather than clobbering a previous repatriation.
@@ -531,4 +565,229 @@ bool RISCVMakeCompressibleRegisterSwap::runOnMachineFunction(
 /// Returns an instance of the Make Compressible Register Swap pass.
 FunctionPass *llvm::createRISCVMakeCompressibleRegisterSwapPass() {
   return new RISCVMakeCompressibleRegisterSwap();
+}
+
+//===----------------------------------------------------------------------===//
+// Post-RA verification
+//===----------------------------------------------------------------------===//
+//
+// The split above is decided before allocation, from a guess about where the
+// allocator will put things. Afterwards the answer is known, so rather than
+// trying to guess better we check, and withdraw the ones that did not pay.
+//
+// Withdrawing costs nothing to implement: copy propagation already knows how
+// to forward a redundant copy into its users and delete it, and would have
+// done so here if NoCopyProp were not stopping it. So this pass never rewrites
+// anything itself. It clears the flag and lets the existing machinery collect
+// the copy, which is why it must run before the first copy propagation.
+//
+// Two ways a split fails to pay:
+//
+//   1) The parent landed in GPRC anyway. s0 and s1 are both callee-saved and
+//      compressible, so a value crossing a call that wins one of them needed
+//      no help; the copy is pure cost. This is the common case.
+//
+//   2) The uses did not compress even with the base in GPRC. c.lw needs *both*
+//      rd and rs1 in x8-x15 and the pre-RA estimate is optimistic about rd, so
+//      a split can move the base and still buy nothing.
+
+#define VERIFY_DEBUG_TYPE "riscv-compressible-swap-verify"
+#define VERIFY_PASS_NAME "RISC-V Compressible Register Swap Verification"
+
+STATISTIC(NumChecked, "Split copies examined after allocation");
+STATISTIC(NumUndoneParentGPRC,
+          "Splits withdrawn: parent was allocated a GPRC register anyway");
+STATISTIC(NumUndoneNoBenefit,
+          "Splits withdrawn: realized savings did not cover the c.mv");
+STATISTIC(NumConfirmed, "Splits confirmed profitable after allocation");
+STATISTIC(NumUnknown, "Splits kept because the uses could not all be seen");
+
+static cl::opt<bool>
+    EnableVerify("riscv-swap-verify", cl::Hidden, cl::init(true),
+                 cl::desc("Withdraw call-boundary splits that did not pay off "
+                          "once real registers are known"));
+
+static cl::opt<unsigned> MaxVerifyBlocks(
+    "riscv-swap-verify-max-blocks", cl::Hidden, cl::init(64),
+    cl::desc("Blocks the verifier will walk following a split's value before "
+             "giving up and keeping the split unjudged"));
+
+namespace {
+
+class RISCVCompressibleSwapVerify : public MachineFunctionPass {
+public:
+  static char ID;
+
+  RISCVCompressibleSwapVerify() : MachineFunctionPass(ID) {}
+
+  StringRef getPassName() const override { return VERIFY_PASS_NAME; }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesAll();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
+  bool runOnMachineFunction(MachineFunction &Fn) override;
+
+private:
+  const TargetRegisterInfo *TRI = nullptr;
+  bool IsRV64 = false;
+
+  bool splitPaidOff(MachineInstr &Copy, Register Dst, bool &Unknown) const;
+};
+
+} // end anonymous namespace
+
+char RISCVCompressibleSwapVerify::ID = 0;
+
+INITIALIZE_PASS(RISCVCompressibleSwapVerify, VERIFY_DEBUG_TYPE,
+                VERIFY_PASS_NAME, false, false)
+
+static bool isGPRCPhys(Register R) {
+  return R && R.isPhysical() && RISCV::GPRCRegClass.contains(R);
+}
+
+/// Add up what the split actually bought across the region \p Dst is live in,
+/// and say whether that covers the two bytes the c.mv costs.
+///
+/// The scan follows the value out of its own block, because the split pass
+/// deliberately sinks copies to the nearest common dominator of their uses and
+/// hoists them out of loops -- so the copy usually sits *above* the code it
+/// pays for, and a single-block window would see almost none of it.
+///
+/// Each static instruction counts once. This is a code size question, so an
+/// instruction inside a loop still costs its bytes exactly once.
+///
+/// The estimate is deliberately approximate. Post-RA \p Dst is a physical
+/// register, so a block listing it live-in does not strictly prove the value
+/// there is ours rather than something written on a path that bypassed the
+/// copy; proving that is a path-sensitive dataflow problem. Approximation is
+/// acceptable here in a way it would not be in the split pass itself: this
+/// function only decides whether to clear NoCopyProp, so being wrong costs a
+/// couple of bytes, never correctness.
+bool RISCVCompressibleSwapVerify::splitPaidOff(MachineInstr &Copy,
+                                               Register Dst,
+                                               bool &Unknown) const {
+  auto InGPRC = [](const MachineInstr &MI, unsigned N) {
+    const MachineOperand &MO = MI.getOperand(N);
+    return MO.isReg() && isGPRCPhys(MO.getReg());
+  };
+
+  // Scan one block from Begin, returning true if the value survives to the
+  // block's end (no redefinition), so successors are worth following.
+  unsigned Saved = 0;
+  auto scanBlock = [&](MachineBasicBlock &MBB,
+                       MachineBasicBlock::iterator Begin) {
+    for (auto It = Begin, E = MBB.end(); It != E; ++It) {
+      MachineInstr &MI = *It;
+      if (MI.isDebugInstr())
+        continue;
+
+      // Without the split this operand would have read the parent, which is
+      // not in GPRC, so anything that compresses now compresses because of us.
+      if (MI.readsRegister(Dst, TRI) &&
+          wouldCompress(MI, IsRV64,
+                        [&](unsigned N) { return InGPRC(MI, N); }))
+        Saved += 2;
+
+      // Past a redefinition the register no longer carries our value, and
+      // neither do this block's successors by way of this path.
+      if (MI.modifiesRegister(Dst, TRI))
+        return false;
+    }
+    return true;
+  };
+
+  MachineBasicBlock &Entry = *Copy.getParent();
+  SmallPtrSet<MachineBasicBlock *, 16> Visited;
+  SmallVector<MachineBasicBlock *, 16> Worklist;
+
+  if (scanBlock(Entry, std::next(MachineBasicBlock::iterator(Copy)))) {
+    Visited.insert(&Entry);
+    for (MachineBasicBlock *S : Entry.successors())
+      Worklist.push_back(S);
+  }
+
+  unsigned Budget = MaxVerifyBlocks;
+  while (!Worklist.empty()) {
+    MachineBasicBlock *MBB = Worklist.pop_back_val();
+    if (!Visited.insert(MBB).second)
+      continue;
+    // The value does not reach here, so uses here are not ours.
+    if (!MBB->isLiveIn(Dst))
+      continue;
+    if (Budget-- == 0) {
+      // Too large a region to walk. Fall back to keeping the split rather
+      // than judging it on a partial count.
+      Unknown = true;
+      return true;
+    }
+    if (scanBlock(*MBB, MBB->begin()))
+      for (MachineBasicBlock *S : MBB->successors())
+        Worklist.push_back(S);
+  }
+
+  return Saved > 2;
+}
+
+bool RISCVCompressibleSwapVerify::runOnMachineFunction(MachineFunction &Fn) {
+  if (!EnableVerify || skipFunction(Fn.getFunction()))
+    return false;
+
+  const RISCVSubtarget &STI = Fn.getSubtarget<RISCVSubtarget>();
+  if (!STI.hasStdExtZca())
+    return false;
+
+  TRI = STI.getRegisterInfo();
+  IsRV64 = STI.is64Bit();
+
+  LLVM_DEBUG(dbgs() << "*** " << VERIFY_PASS_NAME << ": " << Fn.getName()
+                    << " ***\n");
+
+  // Clearing the flag only re-enables an existing optimization, so the MIR is
+  // unchanged as far as this pass is concerned.
+  for (MachineBasicBlock &MBB : Fn) {
+    for (MachineInstr &MI : MBB) {
+      if (!MI.isCopy() || !MI.getFlag(MachineInstr::NoCopyProp))
+        continue;
+
+      Register Dst = MI.getOperand(0).getReg();
+      Register Src = MI.getOperand(1).getReg();
+      if (!Dst.isPhysical() || !Src.isPhysical())
+        continue;
+
+      ++NumChecked;
+
+      if (isGPRCPhys(Src)) {
+        LLVM_DEBUG(dbgs() << "  withdrawing (parent already GPRC): " << MI);
+        MI.clearFlag(MachineInstr::NoCopyProp);
+        ++NumUndoneParentGPRC;
+        continue;
+      }
+
+      bool Unknown = false;
+      if (!splitPaidOff(MI, Dst, Unknown)) {
+        LLVM_DEBUG(dbgs() << "  withdrawing (no realized benefit): " << MI);
+        MI.clearFlag(MachineInstr::NoCopyProp);
+        ++NumUndoneNoBenefit;
+        continue;
+      }
+
+      // A split kept only because its uses were not all visible has not been
+      // shown to pay off, so it does not count as confirmed. Keeping the two
+      // apart matters: the unknown bucket is where unprofitable splits can
+      // still hide.
+      if (Unknown)
+        ++NumUnknown;
+      else
+        ++NumConfirmed;
+    }
+  }
+
+  return false;
+}
+
+/// Returns an instance of the Compressible Register Swap Verification pass.
+FunctionPass *llvm::createRISCVCompressibleSwapVerifyPass() {
+  return new RISCVCompressibleSwapVerify();
 }

@@ -905,10 +905,28 @@ void TargetInstrInfo::lowerCopy(MachineInstr *MI,
     return;
   }
 
+  // Remember where the expansion will land. copyPhysReg inserts before MI, so
+  // anything appearing between Prev and MI afterwards is newly created.
+  MachineBasicBlock &MBB = *MI->getParent();
+  bool AtBegin = MI->getIterator() == MBB.begin();
+  MachineBasicBlock::iterator Prev =
+      AtBegin ? MBB.end() : std::prev(MI->getIterator());
+
   copyPhysReg(*MI->getParent(), MI, MI->getDebugLoc(), DstMO.getReg(),
               SrcMO.getReg(), SrcMO.isKill(),
               DstMO.getReg().isPhysical() ? DstMO.isRenamable() : false,
               SrcMO.getReg().isPhysical() ? SrcMO.isRenamable() : false);
+
+  // Carry NoCopyProp onto the target move. Post-RA copy propagation runs after
+  // this lowering and recognises target moves through isCopyInstr(), so a flag
+  // that stopped at the COPY would protect nothing.
+  if (MI->getFlag(MachineInstr::NoCopyProp)) {
+    for (MachineBasicBlock::iterator It = AtBegin ? MBB.begin()
+                                                  : std::next(Prev),
+                                     End = MI->getIterator();
+         It != End; ++It)
+      It->setFlag(MachineInstr::NoCopyProp);
+  }
 
   if (MI->getNumOperands() > 2)
     transferImplicitOperands(MI, TRI);

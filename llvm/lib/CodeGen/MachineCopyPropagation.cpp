@@ -595,6 +595,10 @@ bool MachineCopyPropagation::eraseIfRedundant(MachineInstr &Copy,
   if (MRI->isReserved(Src) || MRI->isReserved(Def))
     return false;
 
+  // Deliberate copies are not redundant even when they look it.
+  if (Copy.getFlag(MachineInstr::NoCopyProp))
+    return false;
+
   // Search for an existing copy.
   MachineInstr *PrevCopy =
       Tracker.findAvailCopy(Copy, Def, *TRI, *TII, UseCopyInstr);
@@ -803,6 +807,14 @@ void MachineCopyPropagation::forwardUses(MachineInstr &MI) {
     MachineInstr *Copy = Tracker.findAvailCopy(MI, MOUse.getReg().asMCReg(),
                                                *TRI, *TII, UseCopyInstr);
     if (!Copy)
+      continue;
+
+    // The copy was placed deliberately to move the value into a register
+    // class the machine description cannot express a preference for. It is
+    // redundant in dataflow terms, which is exactly why we must not forward
+    // through it: doing so would send the use back to the register the copy
+    // exists to move it away from.
+    if (Copy->getFlag(MachineInstr::NoCopyProp))
       continue;
 
     std::optional<DestSourcePair> CopyOperands =
@@ -1186,7 +1198,8 @@ void MachineCopyPropagation::BackwardCopyPropagateBlock(
       if (!TRI->regsOverlap(DefReg, SrcReg)) {
         // Unlike forward cp, we don't invoke propagateDefs here,
         // just let forward cp do COPY-to-COPY propagation.
-        if (isBackwardPropagatableCopy(*CopyOperands, *MRI)) {
+        if (!MI.getFlag(MachineInstr::NoCopyProp) &&
+            isBackwardPropagatableCopy(*CopyOperands, *MRI)) {
           Tracker.invalidateRegister(SrcReg.asMCReg(), *TRI, *TII,
                                      UseCopyInstr);
           Tracker.invalidateRegister(DefReg.asMCReg(), *TRI, *TII,
