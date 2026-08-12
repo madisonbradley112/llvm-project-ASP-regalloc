@@ -123,8 +123,15 @@ public:
     NoUSWrap = 1 << 20,      // Instruction supports geps
                              // no unsigned signed wrap.
     SameSign = 1 << 21,      // Both operands have the same sign.
-    InBounds = 1 << 22       // Pointer arithmetic remains inbounds.
+    InBounds = 1 << 22,      // Pointer arithmetic remains inbounds.
                              // Implies NoUSWrap.
+    NoCopyProp = 1 << 23     // This COPY is intentional and must not be
+                             // forwarded or deleted by copy propagation.
+                             // For copies that are redundant in dataflow
+                             // terms but carry a property the machine
+                             // description cannot express, such as an
+                             // encoding-size constraint on the destination
+                             // register class.
   };
 
 private:

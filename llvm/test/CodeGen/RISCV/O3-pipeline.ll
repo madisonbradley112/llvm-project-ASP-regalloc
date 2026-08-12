@@ -139,6 +139,7 @@
 ; CHECK-NEXT:       Slot index numbering
 ; CHECK-NEXT:       Live Interval Analysis
 ; CHECK-NEXT:       Register Coalescer
+; CHECK-NEXT:       RISC-V Make Compressible Register Swap
 ; CHECK-NEXT:       Rename Disconnected Subregister Components
 ; CHECK-NEXT:       Machine Instruction Scheduler
 ; CHECK-NEXT:       Machine Block Frequency Analysis
@@ -160,6 +161,7 @@
 ; CHECK-NEXT:       Virtual Register Rewriter
 ; CHECK-NEXT:       Register Allocation Pass Scoring
 ; CHECK-NEXT:       Stack Slot Coloring
+; CHECK-NEXT:       RISC-V Compressible Register Swap Verification
 ; CHECK-NEXT:       Machine Copy Propagation Pass
 ; CHECK-NEXT:       Machine Loop Invariant Code Motion
 ; CHECK-NEXT:       RISC-V Redundant Copy Elimination
